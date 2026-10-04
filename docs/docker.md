@@ -62,7 +62,7 @@ difference is gotcha 16 below.
   (`docker compose --profile single down` before `--profile batch up -d`).
 - Every start-script knob works from `.env`, which is passed straight into the
   container: `CTX=long`, `KV=kvarn`, `SPEC=dflash2`, `PREFIX_CACHE=1`, `MAX_LEN=`,
-  `MAX_SEQS=`, `SPEC_ATTN=0`, `EXTRA_ARGS=...` (`prepare` also fetches the DFlash2 drafter;
+  `MAX_SEQS=`, `SPEC_ATTN=0`, `REASONING_EFFORT=medium`, `EXTRA_ARGS=...` (`prepare` also fetches the DFlash2 drafter;
   `DFLASH2=0` skips it). The two chat-template steps have knobs of their own:
   `HARDEN_TEMPLATES=0` skips the array-argument hardening, `TRANSLATE_EFFORT=0`
   the effort-vocabulary translation (gotcha 58). `PORT` (default 18020) and

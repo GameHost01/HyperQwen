@@ -199,6 +199,8 @@ All overridable as env vars, defaults in the script:
 | `MAX_SEQS` | 64 | scheduler slots; with fp16 state ~70 short requests fit the page pool |
 | `MAX_LEN` | 150000 | max context. Raising it much past this fails startup, the pool can't hold a longer request |
 | `TOOLS` | 1 | tool/function calling (`--enable-auto-tool-choice --tool-call-parser`). `TOOL_PARSER` (`qwen3_coder`) must match the XML call format this model's chat template emits — `hermes` parses the JSON a Qwen model does *not* produce here, and fails silently. 0 = off, and `tool_choice: "auto"` then 400s |
+| `REASONING_EFFORT` | *(blank = the model's built-in default, xhigh)* | server-level thinking level for requests that do not set one themselves (a per-request `reasoning_effort` still wins). `off` = no thinking at all; `low`/`medium`/`xhigh` = the model's template levels. One `--chat-template-kwargs` flag, no template edit; a `--chat-template-kwargs` of your own in `EXTRA_ARGS` wins |
+| `REASONING_BUDGET` | *(blank = no cap)* | caps the internal chain-of-thought in tokens; combined with `REASONING_EFFORT` into the same flag |
 | `PORT` | 18020 | |
 | `GPU_UTIL` | 0.95 | do not raise: 0.972, the 0.28 default, OOMs in warmup on vLLM 0.29 (#182; the ladder is in `docs/vllm-0.29.md`). Use 0.93 when you want `prompt_logprobs` (quality checks) |
 

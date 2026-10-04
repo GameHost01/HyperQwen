@@ -92,6 +92,7 @@ resolve_effective_config() {
       || echo "[effective-config] KV=$kv"
     echo "[effective-config] MODEL=$_model PORT=$_port"
     echo "[effective-config] MAX_LEN=${MAX_LEN:-<profile default>} MAX_SEQS=${MAX_SEQS:-<profile default>}"
+    echo "[effective-config] REASONING_EFFORT=${REASONING_EFFORT:-<blank: model default xhigh>} REASONING_BUDGET=${REASONING_BUDGET:-<blank: no cap>}"
     echo "[effective-config] VLLM_API_KEY=$_key_status api_key.txt=$_keyfile"
   } >&2
 }

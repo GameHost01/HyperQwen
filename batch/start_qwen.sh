@@ -173,6 +173,40 @@ TOOL_PARSER=${TOOL_PARSER:-qwen3_coder}
 TOOL_ARGS=()
 [ "${TOOLS:-1}" = 1 ] && TOOL_ARGS=(--enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER")
 
+# Chat-template kwargs from the repo's reasoning knobs, passed as ONE
+# --chat-template-kwargs flag, so no template file is edited and the two knobs
+# below can be combined (a second flag would silently win or lose by argparse
+# order). A --chat-template-kwargs of your own in EXTRA_ARGS wins, since
+# EXTRA_ARGS expands after this.
+#
+# REASONING_EFFORT: the default reasoning level for every request that does
+# not set its own (per-request reasoning_effort / chat_template_kwargs still
+# win). low/medium/xhigh are the levels this model's chat template implements
+# (xhigh is its built-in default when this knob is blank); off maps to
+# enable_thinking=false, i.e. no thinking at all. Only those four values are
+# forwarded: this repo's template accepts xhigh/medium/low (clients sending the
+# OpenAI vocabulary still get the gotcha-58 translation per request), so a
+# stray value warns and is ignored rather than 400ing or silently degrading.
+#
+# REASONING_BUDGET (Qwen3): caps the model's internal chain-of-thought length,
+# in tokens. Blank = no cap. Non-numeric values are ignored with a note.
+CT_KWARGS=""
+case "${REASONING_EFFORT:-}" in
+  ''|off|low|medium|xhigh) ;;
+  *) echo "REASONING_EFFORT='$REASONING_EFFORT' is not off|low|medium|xhigh; ignoring (blank = model default xhigh)." >&2 ;;
+esac
+case "${REASONING_EFFORT:-}" in
+  off) CT_KWARGS="${CT_KWARGS:+${CT_KWARGS},}\"enable_thinking\":false" ;;
+  low|medium|xhigh) CT_KWARGS="${CT_KWARGS:+${CT_KWARGS},}\"reasoning_effort\":\"$REASONING_EFFORT\"" ;;
+esac
+case "${REASONING_BUDGET:-}" in
+  ''|*[!0-9]*)
+    [ -n "${REASONING_BUDGET:-}" ] && echo "REASONING_BUDGET='$REASONING_BUDGET' is not a plain integer; ignoring (use e.g. 1024)." >&2
+    ;;
+  *) CT_KWARGS="${CT_KWARGS:+${CT_KWARGS},}\"reasoning_budget\":${REASONING_BUDGET}" ;;
+esac
+[ -n "$CT_KWARGS" ] && EXTRA_ARGS="--chat-template-kwargs {$CT_KWARGS} ${EXTRA_ARGS}"
+
 # REQ_METRICS=1: per-request timing fields + usage on every response (issue #51).
 # Not with --disable-log-stats (the timing fields need the engine-stats path).
 # Array, not $( [ ] && echo ): the command substitution exits 1 when the test

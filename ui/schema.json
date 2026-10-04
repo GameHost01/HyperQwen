@@ -1,0 +1,552 @@
+{
+  "groups": [
+    {
+      "id": "mode",
+      "title": "Presets & Mode",
+      "blurb": "What the server is tuned to do. One GPU runs one mode at a time.",
+      "fields": [
+        {
+          "key": "SPEC",
+          "label": "Speculative drafter",
+          "type": "enum",
+          "options": [
+            "mtp",
+            "dflash2",
+            "off",
+            "none"
+          ],
+          "default": "mtp",
+          "modes": [
+            "single"
+          ],
+          "desc": "How the model drafts ahead to go faster. mtp = built-in head (safe default). dflash2 = block drafter (fastest for one user). off/none = no speculation."
+        },
+        {
+          "key": "CTX",
+          "label": "Context size",
+          "type": "enum",
+          "options": [
+            "fast",
+            "long",
+            "huge"
+          ],
+          "default": "fast",
+          "modes": [
+            "single"
+          ],
+          "desc": "fast = 64k context, fastest. long = 150k context. huge = 240k context (needs KVarN; slower)."
+        },
+        {
+          "key": "KV",
+          "label": "KV-cache type (batch only)",
+          "type": "enum",
+          "options": [
+            "fp8",
+            "kvarn",
+            "int4pth"
+          ],
+          "default": "fp8",
+          "modes": [
+            "batch"
+          ],
+          "desc": "Batch mode only. fp8 = default. kvarn = 4/2-bit cache for 262k context. int4pth = int4 per-token-head."
+        },
+        {
+          "key": "PREFIX_CACHE",
+          "label": "Reuse shared prompt (prefix cache)",
+          "type": "bool",
+          "default": "0",
+          "modes": [
+            "both"
+          ],
+          "desc": "Keeps a document you already sent, so follow-up turns are ~20x faster. On for chat, off for unrelated one-shot prompts."
+        }
+      ]
+    },
+    {
+      "id": "capacity",
+      "title": "Context & Capacity",
+      "blurb": "How much context and how many simultaneous requests.",
+      "fields": [
+        {
+          "key": "MAX_LEN",
+          "label": "Max context (tokens)",
+          "type": "int",
+          "default": "65536",
+          "modes": [
+            "both"
+          ],
+          "desc": "Largest prompt+answer in tokens. 65536 for fast, 150000 for long."
+        },
+        {
+          "key": "MAX_SEQS",
+          "label": "Max simultaneous requests",
+          "type": "int",
+          "default": "8",
+          "modes": [
+            "both"
+          ],
+          "desc": "How many requests are admitted at once. 8 single-user, 64 batch."
+        },
+        {
+          "key": "GPU_UTIL",
+          "label": "GPU memory to use (0–1)",
+          "type": "float",
+          "default": "0.93",
+          "min": 0.1,
+          "max": 1,
+          "modes": [
+            "both"
+          ],
+          "desc": "Fraction of GPU memory reserved. 0.93 single, 0.95 batch. Don't raise past this."
+        },
+        {
+          "key": "DFLASH_TOKENS",
+          "label": "Verify block (dflash2)",
+          "type": "int",
+          "default": "7",
+          "modes": [
+            "single"
+          ],
+          "desc": "Tokens verified per step with dflash2. 7 = normal. 15 = 'reproduce/quote' mode (4 slots, 56k context, much faster when the answer quotes the prompt)."
+        },
+        {
+          "key": "DRAFT_TOKENS",
+          "label": "Draft depth (mtp)",
+          "type": "int",
+          "default": "4",
+          "modes": [
+            "single"
+          ],
+          "desc": "How many tokens mtp drafts per step. 4 default (3 for long/huge). 5–6 are slower."
+        },
+        {
+          "key": "KV_MEM",
+          "label": "Pin KV pool (bytes, advanced)",
+          "type": "int",
+          "default": "",
+          "modes": [
+            "single"
+          ],
+          "desc": "Pin the KV pool to an exact byte size. Leave empty to size from GPU_UTIL."
+        }
+      ]
+    },
+    {
+      "id": "draft",
+      "title": "Drafting & Speculation",
+      "blurb": "Fine controls for the drafting (advanced — defaults are good).",
+      "fields": [
+        {
+          "key": "SPEC_ATTN",
+          "label": "Split-KV verify attention",
+          "type": "bool",
+          "default": "1",
+          "modes": [
+            "single"
+          ],
+          "desc": "faster verify step on CTX=fast. Leave on."
+        },
+        {
+          "key": "DRAFT_SAMPLE",
+          "label": "Draft sampling",
+          "type": "enum",
+          "options": [
+            "probabilistic",
+            "greedy"
+          ],
+          "default": "probabilistic",
+          "modes": [
+            "single"
+          ],
+          "desc": "probabilistic = right for temperature > 0. greedy = same speed at T=0, ~15% slower at T>0."
+        },
+        {
+          "key": "LOOKUP",
+          "label": "Draft from the prompt (lookup)",
+          "type": "bool",
+          "default": "1",
+          "modes": [
+            "single"
+          ],
+          "desc": "dflash2 only. Lets the drafter copy text straight from your prompt when the answer repeats it. Leave on."
+        },
+        {
+          "key": "MTP_DRAFT_VOCAB",
+          "label": "Use 40k draft vocabulary",
+          "type": "bool",
+          "default": "1",
+          "modes": [
+            "single"
+          ],
+          "desc": "Faster drafting. Set off if you mostly send Chinese or other text outside English/Danish/code."
+        }
+      ]
+    },
+    {
+      "id": "perf",
+      "title": "Performance & Quantization",
+      "blurb": "int8 speed tweaks (mostly for batch / prefill).",
+      "fields": [
+        {
+          "key": "INT8_ACT",
+          "label": "int8 activations",
+          "type": "enum",
+          "options": [
+            "",
+            "int8"
+          ],
+          "default": "",
+          "modes": [
+            "both"
+          ],
+          "desc": "int8 tensor-core GEMMs for faster prefill. (empty) = off (single default), int8 = on (batch default)."
+        },
+        {
+          "key": "INT8_LAYERS",
+          "label": "Which layers go int8",
+          "type": "enum",
+          "options": [
+            "mlp",
+            "gate_up",
+            "."
+          ],
+          "default": "mlp",
+          "modes": [
+            "batch"
+          ],
+          "desc": "mlp = default, gate_up = gentler, . = every layer (fastest, +3.7% perplexity, needs GPU_UTIL 0.95)."
+        },
+        {
+          "key": "PREFILL_ATTN",
+          "label": "int8 prefill attention",
+          "type": "enum",
+          "options": [
+            "",
+            "int8"
+          ],
+          "default": "",
+          "modes": [
+            "both"
+          ],
+          "desc": "Companion to int8 activations for a few long prompts. Usually leave off."
+        }
+      ]
+    },
+    {
+      "id": "features",
+      "title": "Features",
+      "blurb": "Turn capabilities on/off.",
+      "fields": [
+        {
+          "key": "TOOLS",
+          "label": "Tool / function calling",
+          "type": "bool",
+          "default": "1",
+          "modes": [
+            "both"
+          ],
+          "desc": "Lets clients call tools (tool_calls). Off and tool_choice:'auto' will 400."
+        },
+        {
+          "key": "TOOL_PARSER",
+          "label": "Tool-call parser",
+          "type": "enum",
+          "options": [
+            "qwen3_coder",
+            "hermes"
+          ],
+          "default": "qwen3_coder",
+          "modes": [
+            "both"
+          ],
+          "desc": "Must match the model's output format. qwen3_coder is correct for Qwen here."
+        },
+        {
+          "key": "REASONING_EFFORT",
+          "label": "Reasoning effort (thinking level)",
+          "type": "enum",
+          "options": [
+            "off",
+            "low",
+            "medium",
+            "xhigh"
+          ],
+          "default": "medium",
+          "modes": [
+            "both"
+          ],
+          "desc": "Server-level default thinking level for requests that do not set one themselves (a per-request reasoning_effort still wins). off = no thinking at all; low = brief; medium = balanced; xhigh = the model's built-in default (what blank means). Restart the server after saving."
+        },
+        {
+          "key": "VISION",
+          "label": "Keep vision tower (images)",
+          "type": "bool",
+          "default": "0",
+          "modes": [
+            "both"
+          ],
+          "desc": "On to accept images (costs ~0.86 GB). Off for text-only."
+        },
+        {
+          "key": "VISION_OFFLOAD",
+          "label": "Offload vision tower to RAM",
+          "type": "bool",
+          "default": "1",
+          "modes": [
+            "single"
+          ],
+          "desc": "With VISION on, keeps the tower in host RAM. Needed on 24 GB + dflash2."
+        },
+        {
+          "key": "REQ_METRICS",
+          "label": "Per-request metrics",
+          "type": "bool",
+          "default": "0",
+          "modes": [
+            "both"
+          ],
+          "desc": "Adds timing fields to each response (what llama-swap dashboards read)."
+        },
+        {
+          "key": "SSE_KEEP_ALIVE",
+          "label": "Stream keep-alive (seconds)",
+          "type": "int",
+          "default": "30",
+          "modes": [
+            "both"
+          ],
+          "desc": "Keep-alive interval so long streams survive a proxy timeout during a long prefill."
+        },
+        {
+          "key": "FAST_VARIANT",
+          "label": "Download fast variant model",
+          "type": "bool",
+          "default": "1",
+          "modes": [
+            "both"
+          ],
+          "desc": "On for the +15% faster variant at first boot. Off for a lighter setup."
+        },
+        {
+          "key": "WARMUP",
+          "label": "Warm up after boot",
+          "type": "bool",
+          "default": "0",
+          "modes": [
+            "single"
+          ],
+          "desc": "qwen-server.sh only: run a warm-up pass so the first real request is fast."
+        }
+      ]
+    },
+    {
+      "id": "net",
+      "title": "Network & Identity",
+      "blurb": "Where the server listens and how it's secured.",
+      "fields": [
+        {
+          "key": "PORT",
+          "label": "Port",
+          "type": "int",
+          "default": "18020",
+          "min": 1,
+          "max": 65535,
+          "modes": [
+            "both"
+          ],
+          "desc": "The API port. Change only to avoid a conflict."
+        },
+        {
+          "key": "MODEL",
+          "label": "Model path",
+          "type": "text",
+          "default": "models/Qwen3.8-27B-W4A16-AutoRound",
+          "modes": [
+            "both"
+          ],
+          "desc": "Path to the model. Usually leave as-is."
+        },
+        {
+          "key": "VLLM_API_KEY",
+          "label": "API key",
+          "type": "secret",
+          "default": "",
+          "modes": [
+            "both"
+          ],
+          "desc": "REQUIRED before the port is reachable by anything but this machine — the server has no other auth. Use 'Generate' below."
+        },
+        {
+          "key": "HF_TOKEN",
+          "label": "Hugging Face token",
+          "type": "secret",
+          "default": "",
+          "modes": [
+            "both"
+          ],
+          "desc": "Your HF token for model downloads. Leave as-is if set."
+        },
+        {
+          "key": "VLLM_WSL2_ENABLE_PIN_MEMORY",
+          "label": "WSL2 pin memory",
+          "type": "bool",
+          "default": "1",
+          "modes": [
+            "both"
+          ],
+          "desc": "Keep on for Docker Desktop / WSL2, or the server aborts with a UVA error. No cost on native Linux."
+        }
+      ]
+    },
+    {
+      "id": "advanced",
+      "title": "Advanced (expert)",
+      "blurb": "Power-user overrides. Extra args win over every other flag.",
+      "fields": [
+        {
+          "key": "EXTRA_ARGS",
+          "label": "Extra vLLM args (raw)",
+          "type": "text",
+          "default": "",
+          "modes": [
+            "both"
+          ],
+          "desc": "Raw vLLM flags appended last (so they override). E.g. --tensor-parallel-size 2. Leave empty unless you know why."
+        },
+        {
+          "key": "CUDA_VISIBLE_DEVICES",
+          "label": "Visible GPUs",
+          "type": "text",
+          "default": "",
+          "modes": [
+            "both"
+          ],
+          "desc": "Pin which GPU cards, e.g. 1,2. Leave empty for the default."
+        },
+        {
+          "key": "GPU_COUNT",
+          "label": "GPU count handed to container",
+          "type": "text",
+          "default": "1",
+          "modes": [
+            "both"
+          ],
+          "desc": "1 = first GPU. 2 / all for multi-GPU tensor parallelism."
+        },
+        {
+          "key": "OS_VRAM",
+          "label": "OS / Display VRAM (MiB)",
+          "type": "text",
+          "default": "512",
+          "modes": [
+            "both"
+          ],
+          "desc": "VRAM held by Windows (DWM, display buffers, WSL2 compositor). Typical: 400-600 MiB. Set 0 to exclude."
+        }
+      ]
+    }
+  ],
+  "presets": [
+    {
+      "id": "A",
+      "name": "A — Batch (many requests)",
+      "mode": "batch",
+      "launch": "up-batch",
+      "sets": {
+        "SPEC": "",
+        "CTX": "",
+        "DFLASH_TOKENS": "",
+        "DRAFT_TOKENS": "",
+        "KV": "fp8",
+        "REASONING_EFFORT": "medium",
+        "INT8_ACT": "int8",
+        "INT8_LAYERS": "mlp",
+        "MAX_SEQS": "64",
+        "MAX_LEN": "150000",
+        "GPU_UTIL": "0.95"
+      },
+      "desc": "API backend / many concurrent. 64 slots, 150k context, int8 speed."
+    },
+    {
+      "id": "B",
+      "name": "B — Single (default)",
+      "mode": "single",
+      "launch": "up-single",
+      "sets": {
+        "SPEC": "dflash2",
+        "CTX": "fast",
+        "DFLASH_TOKENS": "",
+        "DRAFT_TOKENS": "4",
+        "REASONING_EFFORT": "medium",
+        "KV": "",
+        "INT8_ACT": "",
+        "INT8_LAYERS": "",
+        "MAX_SEQS": "8",
+        "MAX_LEN": "65536",
+        "GPU_UTIL": "0.93"
+      },
+      "desc": "One/few people chatting. 64k context, 8 slots, fastest default."
+    },
+    {
+      "id": "C",
+      "name": "C — Single + quote/reproduce",
+      "mode": "single",
+      "launch": "up-single",
+      "sets": {
+        "SPEC": "dflash2",
+        "CTX": "fast",
+        "DFLASH_TOKENS": "15",
+        "REASONING_EFFORT": "medium",
+        "DRAFT_TOKENS": "",
+        "KV": "",
+        "INT8_ACT": "",
+        "INT8_LAYERS": "",
+        "MAX_SEQS": "",
+        "MAX_LEN": "",
+        "GPU_UTIL": "0.93"
+      },
+      "desc": "When answers quote the prompt (code edits, RAG, translation). 4 slots, 56k."
+    },
+    {
+      "id": "D",
+      "name": "D — Single, long context",
+      "mode": "single",
+      "launch": "up-single",
+      "sets": {
+        "SPEC": "mtp",
+        "CTX": "long",
+        "REASONING_EFFORT": "medium",
+        "DFLASH_TOKENS": "",
+        "DRAFT_TOKENS": "3",
+        "KV": "",
+        "INT8_ACT": "",
+        "INT8_LAYERS": "",
+        "MAX_SEQS": "8",
+        "MAX_LEN": "150000",
+        "GPU_UTIL": "0.93"
+      },
+      "desc": "150k context, ~95-100 tok/s."
+    },
+    {
+      "id": "E",
+      "name": "E — Single, huge context",
+      "mode": "single",
+      "launch": "up-single",
+      "sets": {
+        "SPEC": "dflash2",
+        "CTX": "huge",
+        "REASONING_EFFORT": "medium",
+        "DFLASH_TOKENS": "",
+        "DRAFT_TOKENS": "3",
+        "KV": "",
+        "INT8_ACT": "",
+        "INT8_LAYERS": "",
+        "MAX_SEQS": "8",
+        "MAX_LEN": "200000",
+        "GPU_UTIL": "0.93"
+      },
+      "desc": "200k+ context via KVarN. Slower past ~100k, for very long docs."
+    }
+  ]
+}
