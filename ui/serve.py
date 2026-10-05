@@ -30,11 +30,12 @@ import socketserver
 import struct
 import subprocess
 import sys
+import time
 import threading
 import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ---------------------------------------------------------------- paths
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # .../HyperQwen
@@ -476,7 +477,10 @@ ACTION_ARGS = {
     "logs":       ["docker", "compose", "logs", "--tail", "80"],
     "up-single":  ["docker", "compose", "--profile", "single", "up", "-d"],
     "up-batch":   ["docker", "compose", "--profile", "batch", "up", "-d"],
-    "down":       ["docker", "compose", "down"],
+    # down must list the profiles too: without them compose only stops the
+    # non-profile service (prepare) and leaves single/batch/solo running
+    "down":       ["docker", "compose", "--profile", "single", "--profile", "batch",
+                  "--profile", "solo", "down"],
 }
 DESTRUCTIVE = {"down"}
 
@@ -493,6 +497,600 @@ def run_action(name):
         return {"ok": False, "error": "timed out (180s)"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+# ---------------------------------------------------------------- startup progress
+#
+# A time-based startup bar for the serve container (single/batch/solo).
+# Instead of docker's "Container ... Starting/Started" (which only means the
+# process is alive), the UI parses the container's timestamped log and tracks
+# the boot as a sequence of phases, each delimited by marker lines:
+#
+#   06:59:31  entrypoint: first-boot stages: [1/3] prepare [2/3] verify [3/3] start
+#   06:59:31  prepare: model ready at ...                     (0.2 s once prepared)
+#   07:00:08  verify: OK (0 failures)                         (~37 s)
+#   07:00:31  Using FLASHINFER attention backend ...          (~24 s)
+#   07:00:32  Loading safetensors checkpoint shards:   0% | 0/8
+#   07:02:26  ...                                           100% | 8/8   (114 s)
+#   07:02:26  Loading weights took 113.96 seconds
+#   07:02:30  (second pass: MTP/draft head)                    (8.3 s)
+#   07:02:45  torch.compile took ...
+#   07:02:45  GPU KV cache size: ...
+#   07:02:48  Capturing CUDA graphs ... 100%
+#   07:02:51  Started server process
+#   07:02:52  Application startup complete.                  <- model loaded
+#
+# The bar at any moment is (elapsed in this run) / (estimated total for this
+# run), where each phase's estimate is (a) its measured duration if it has
+# already completed in this run, (b) a measurement from a previous boot still
+# in the log tail or from a cached measurement under the same settings
+# fingerprint (.bootcal.json) — this is the on-the-fly re-calibration when
+# settings change, or (c) a built-in default. Weight/draft/CUDA phases
+# additionally show the actual N% from the log. Every phase that completes
+# during a boot replaces its estimate with the real number, so the bar
+# converges on the truth for the current settings.
+
+BOOT_PHASE_DEFAULTS = {
+    "prepare": 3.0,     # 0.2 s once prepared; first boot (download) takes far longer
+    "verify": 45.0,
+    "engine": 25.0,
+    "load": 120.0,
+    "draft": 12.0,
+    "compile": 12.0,
+    "kv": 2.0,
+    "cuda": 6.0,
+    "server": 6.0,
+    "ready": 3.0,
+}
+BOOT_PHASE_ORDER = ["prepare", "verify", "engine", "load", "draft",
+                   "compile", "kv", "cuda", "server", "ready"]
+PHASE_LABELS = {
+    "prepare": "Preparing model",
+    "verify": "Verifying",
+    "engine": "Engine init",
+    "load": "Loading weights",
+    "draft": "Loading draft head",
+    "compile": "torch.compile",
+    "kv": "KV cache",
+    "cuda": "CUDA graphs",
+    "server": "Server start",
+    "ready": "Model loaded",
+}
+
+# settings that change how long a boot takes -> fingerprint for the measurement cache
+BOOT_CAL_KEYS = ["FAST_VARIANT", "SPEC", "CTX", "KV", "GPU_UTIL",
+                "DFLASH_TOKENS", "DRAFT_TOKENS", "VISION", "VISION_OFFLOAD",
+                "GPU_COUNT", "MAX_LEN", "INT8_ACT", "PREFILL_ATTN", "EXTRA_ARGS"]
+BOOTCAL_PATH = os.path.join(UI_DIR, ".bootcal.json")
+_bootcal_saved = None   # (fingerprint, signature) of the last cache write
+_pct_state = {}         # container name -> {"boot": boot-marker epoch, "pct": last displayed %}
+
+RE_LOGLINE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z")
+RE_SHARDS = re.compile(r"Loading safetensors checkpoint shards:\s*(\d{1,3})%\s*\S+\s*\|\s*(\d+)/(\d+)")
+RE_CUDAGRAPH = re.compile(r"Capturing (?:prefill )?CUDA graphs[^:]*:\s*(\d{1,3})%\|[^|]*\|\s*(\d+)/(\d+)")
+RE_ATTN = re.compile(r"Using [A-Z0-9_]+ attention backend out of potential backends")
+RE_FATAL = re.compile(
+    r"UVA is not available|OutOfMemoryError|CUDA driver error|out of memory|"
+    r"Traceback \(most recent call last\)|entrypoint: verify\.sh FAILED", re.I)
+
+
+def _iter_log_lines(text):
+    """Yield (epoch, body) per line of a `docker logs --timestamps` stream.
+
+    The prefix is '<UTC ts> '; bodies may start with and contain CRs (tqdm
+    progress updates inside one line) — left in the body for the regexes."""
+    for raw in text.split("\n"):
+        m = RE_LOGLINE.match(raw)
+        if not m:
+            continue
+        g = m.groups()
+        try:
+            ts = datetime(int(g[0]), int(g[1]), int(g[2]), int(g[3]),
+                           int(g[4]), int(g[5]), tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+        ts += int((g[6] or "0")[:6]) / 1e6
+        yield ts, raw[m.end():].lstrip("\r\n \t")
+
+
+def _scan_hits(events):
+    """Marker hits in a (possibly partial) run. Each key -> list of epochs;
+    loadPct/cudaPct -> (epoch, pct, i, n); fatal -> (epoch, body)."""
+    hits = {k: [] for k in ("boot", "preReady", "verify", "attn", "load0", "loadPct",
+                            "took", "compile", "kv", "cudaPct", "cuda100",
+                            "server", "complete", "fatal")}
+    for ts, body in events:
+        if "entrypoint: first-boot stages" in body:
+            hits["boot"].append(ts)
+        if "prepare: model ready at" in body:
+            hits["preReady"].append(ts)
+        if re.search(r"verify: \d+ FAILURE", body):
+            hits["verify"].append(ts)
+            hits["fatal"].append((ts, body))
+        elif "verify: OK" in body:
+            hits["verify"].append(ts)
+        if RE_ATTN.search(body):
+            hits["attn"].append(ts)
+        for pct, i, n in RE_SHARDS.findall(body):
+            if pct == "0" and i == "0":
+                hits["load0"].append(ts)
+            else:
+                hits["loadPct"].append((ts, int(pct), int(i), int(n)))
+        if "Loading weights took" in body:
+            hits["took"].append(ts)
+        if "torch.compile took" in body:
+            hits["compile"].append(ts)
+        if "GPU KV cache size:" in body:
+            hits["kv"].append(ts)
+        for pct, i, n in RE_CUDAGRAPH.findall(body):
+            hits["cudaPct"].append((ts, int(pct), int(i), int(n)))
+            if pct == "100":
+                hits["cuda100"].append(ts)
+        if "Started server process" in body:
+            hits["server"].append(ts)
+        if "Application startup complete" in body:
+            hits["complete"].append(ts)
+        if RE_FATAL.search(body):
+            hits["fatal"].append((ts, body))
+    return hits
+
+
+def _one(hits, k):
+    v = hits.get(k) or []
+    return v[0] if v else None
+
+
+def _last_before(cands, before):
+    v = [t for t in (cands or []) if before is None or t < before]
+    return v[-1] if v else None
+
+
+def _shard_prog(hits, which):
+    """Latest shard progress of the given loading pass."""
+    cands = hits.get("loadPct") or []
+    if which == "draft" and len(hits.get("load0") or []) < 2:
+        return None
+    if which == "load" and len(hits.get("load0") or []) > 1:
+        cands = [e for e in cands if e[0] < hits["load0"][1]]
+    elif which == "draft":
+        cands = [e for e in cands if e[0] >= hits["load0"][1]]
+    if not cands:
+        return None
+    ts, pct, i, n = cands[-1]
+    return {"kind": "shards", "pct": pct, "i": i, "n": n}
+
+
+def _cuda_prog(hits, t0, t1):
+    c = [e for e in (hits.get("cudaPct") or [])
+         if (t0 is None or e[0] >= t0) and (t1 is None or e[0] <= t1)]
+    if not c:
+        return None
+    ts, pct, i, n = c[-1]
+    return {"kind": "steps", "pct": pct, "i": i, "n": n}
+
+
+def _build_phases(hits, expect_draft=False):
+    """Ordered phase timeline (t0/t1 epochs, measured durations) for one run
+    window. A partial window (no boot marker, or a log whose tail no longer
+    contains the early markers) still yields every phase whose two boundaries
+    are both present.
+
+    Phase boundaries are anchored on plain (non-progress) log lines wherever
+    possible — tqdm progress lines can drop out of a long-lived log — with
+    progress markers used as secondary anchors:
+
+      prepare:  boot marker          -> 'prepare: model ready at'
+      verify:   prepare end          -> 'verify: OK' / 'verify: N FAILURE(S)'
+      engine:  verify end           -> first of attn-backend / 0% shard / first shard %
+      load:     (load start)         -> first 'Loading weights took'
+      draft:    1st 'took'           -> 2nd 'took'          (2nd shard pass = MTP head;
+                                                             while in flight: 1st 'took' -> open)
+      compile:  2nd 'took' (the 1st on single-pass boots) -> last 'torch.compile took'
+      kv:       compile end          -> 'GPU KV cache size'
+      cuda:     kv end               -> last 100% graph marker
+      server:   cuda end (or kv end) -> 'Started server process'
+      ready:    server end           -> 'Application startup complete'
+    """
+    ph = []
+
+    def step(key, t0, t1, prog=None):
+        # A phase is PENDING (t0 = None) until its own start marker shows up,
+        # and its start marker is the phase before it CLOSING — never the phase
+        # before it starting. So at most one phase is open at any moment and a
+        # newly starting phase can never resize the bar's denominator.
+        if t0 is None and t1 is None:
+            return None
+        if t0 is not None and t1 is not None and t1 < t0:
+            t1 = t0
+        ph.append({"key": key, "label": PHASE_LABELS[key], "t0": t0, "t1": t1,
+                  "dur": round(t1 - t0, 2) if (t0 is not None and t1 is not None) else None,
+                  "progress": prog})
+        return t1
+
+    t_boot = _one(hits, "boot")
+    t_prep = _one(hits, "preReady")
+    t_vfy = _one(hits, "verify")
+    step("prepare", t_boot, t_prep)
+    step("verify", t_prep, t_vfy)
+
+    # Weight-load start: the attention-backend line (a plain, surviving line)
+    # precedes the first 0% shard line by ~1 s; use whichever is available.
+    load_start = _one(hits, "attn")
+    if load_start is None and hits.get("load0"):
+        load_start = hits["load0"][0]
+    if load_start is None and hits.get("loadPct"):
+        load_start = hits["loadPct"][0][0]
+    step("engine", t_vfy, load_start)
+
+    tooks = hits.get("took") or []
+    t_load_end = tooks[0] if tooks else None
+    step("load", load_start, t_load_end, _shard_prog(hits, "load"))
+
+    n_bars = len(hits.get("load0") or [])
+    if tooks and len(tooks) > 1:
+        # 2nd load pass = MTP/draft head (only fast variants have one)
+        step("draft", t_load_end, tooks[1], _shard_prog(hits, "draft"))
+        c0 = tooks[1]
+    elif t_load_end is not None and (n_bars >= 2 or expect_draft):
+        # The 1st pass is done but its 'took' twin is still to come: the MTP/draft
+        # pass is in flight. Keep it OPEN (visible pill with its real shard %), and
+        # hold compile back until the draft closes - compile must never start from
+        # the 1st 'took' while the 2nd pass is still loading.
+        step("draft", t_load_end, None, _shard_prog(hits, "draft"))
+        c0 = None
+    else:
+        # Single-pass boot (no MTP head): torch.compile follows the 1st 'took' directly.
+        c0 = t_load_end
+
+    kv_t = _one(hits, "kv")
+    c1 = _last_before(hits.get("compile"), kv_t)
+    if c1 is None:
+        cands = hits.get("compile") or []
+        c1 = cands[-1] if cands else None
+    step("compile", c0, c1)
+    step("kv", c1, kv_t)
+
+    # CUDA graphs: the 100% marker can drop out of a truncated window; any late
+    # graph-progress line is a good-enough end anchor.
+    cuda_pcts = hits.get("cudaPct") or []
+    cu_end = max(hits["cuda100"]) if hits.get("cuda100") else None
+    if cu_end is None and cuda_pcts:
+        last = cuda_pcts[-1]
+        cu_end = last[0] if last[1] == 100 else None
+    step("cuda", kv_t, cu_end, _cuda_prog(hits, kv_t, cu_end))
+
+    t_srv = _one(hits, "server")
+    step("server", cu_end or kv_t, t_srv)
+    step("ready", t_srv, _one(hits, "complete"))
+    return ph
+
+
+def _fingerprint_from_env_list(env_list):
+    d = {}
+    for item in env_list or []:
+        if "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        if k in BOOT_CAL_KEYS:
+            d[k] = v
+    return json.dumps(d, sort_keys=True)
+
+
+def _env_fingerprint():
+    return _fingerprint_from_env_list(
+        ["%s=%s" % (k, v) for k, v in parse_env(read_env_text()).items()])
+
+
+def _container_fingerprint(name):
+    """Settings fingerprint from the container's own environment (what the
+    running boot actually used), falling back to the current .env."""
+    try:
+        r = subprocess.run(["docker", "inspect", name, "--format", "{{json .Config.Env}}"],
+                           cwd=REPO, capture_output=True, text=True, timeout=15)
+        return _fingerprint_from_env_list(json.loads(r.stdout.strip() or "[]"))
+    except Exception:
+        return _env_fingerprint()
+
+
+def _bootcal_load(fp):
+    """Cached per-phase seconds: exact settings match first, else the most
+    recent measurement under any settings (a fallback estimate)."""
+    try:
+        with open(BOOTCAL_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    if fp in data and data[fp].get("phases"):
+        return data[fp]["phases"]
+    best = None
+    for rec in data.values():
+        if not rec.get("phases"):
+            continue
+        if best is None or (rec.get("at") or "") > (best[0] or ""):
+            best = (rec.get("at"), rec["phases"])
+    return best[1] if best else {}
+
+
+def _bootcal_save(fp, phases):
+    global _bootcal_saved
+    sig = (fp, tuple(sorted((k, round(v, 1)) for k, v in phases.items())))
+    if sig == _bootcal_saved:
+        return
+    _bootcal_saved = sig
+    try:
+        with open(BOOTCAL_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data[fp] = {"at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "phases": {k: round(v, 2) for k, v in phases.items()}}
+    if len(data) > 12:
+        for k in sorted(data, key=lambda k: data[k].get("at") or "")[: len(data) - 12]:
+            del data[k]
+    try:
+        with open(BOOTCAL_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+    except Exception:
+        pass
+
+
+def find_serve_container():
+    """The hyperqwen serve container (single/batch/solo): the running one if
+    any, else the most recent stopped one (a failed boot)."""
+    try:
+        r = subprocess.run(["docker", "ps", "-a", "--format", "json"],
+                           cwd=REPO, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    running, stopped = [], []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            c = json.loads(line)
+        except Exception:
+            continue
+        if "hyperqwen" not in (c.get("Image") or ""):
+            continue
+        labels = c.get("Labels")
+        if not isinstance(labels, str):
+            labels = json.dumps(labels or {})
+        msvc = re.search(r"com\.docker\.compose\.service=([A-Za-z0-9_-]+)", labels)
+        if not msvc or msvc.group(1) not in ("single", "batch", "solo"):
+            continue
+        row = {"name": c.get("Names") or "", "service": msvc.group(1),
+               "state": c.get("State") or "", "health": c.get("HealthStatus") or "",
+               "status": c.get("Status") or ""}
+        (running if row["state"] == "running" else stopped).append(row)
+    if running:
+        return running[0]
+    return stopped[-1] if stopped else None
+
+
+def boot_progress(tail=3000):
+    """One-shot startup-progress snapshot for the settings UI.
+
+    The --tail window defaults to 3000 lines so a fully-timestamped boot (with
+    its tqdm progress lines, which are many per second) stays inside the window
+    even after the server has been running a while."""
+    if not docker_available():
+        return {"ok": True, "docker": False, "container": None,
+                "run": {"state": "no-docker", "pct": 0.0}}
+    cont = find_serve_container()
+    if cont is None:
+        return {"ok": True, "docker": True, "container": None,
+                "run": {"state": "stopped", "pct": 0.0}}
+
+    try:
+        # NO text=True: it enables universal-newline translation, which converts the
+        # CRs embedded in tqdm progress lines (one \n-record can hold many \r updates)
+        # into \n — orphaning the progress text from its timestamp and breaking the
+        # shard/CUDA-graph progress regexes. Capture bytes and decode without translation.
+        # Also merge the container's stderr into the stream: the docker CLI forwards
+        # the container's stderr on the client's stderr, and this image writes uvicorn's
+        # "Started server process" / "Application startup complete" and the CUDA-graph
+        # tqdm lines there — a stdout-only capture loses them (and the progress bars).
+        r = subprocess.run(["docker", "logs", "--timestamps", "--tail", str(tail),
+                            cont["name"]],
+                           cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=30)
+        text = (r.stdout or b"").decode("utf-8", "replace")
+    except Exception as e:
+        return {"ok": True, "docker": True, "container": cont,
+                "run": {"state": "unknown", "pct": 0.0, "error": str(e)}}
+
+    events = list(_iter_log_lines(text))
+    if not events:
+        st = "starting" if cont["state"] in ("running", "created") else "stopped"
+        return {"ok": True, "docker": True, "container": cont,
+                "run": {"state": st, "pct": 0.0,
+                         "note": "no log lines yet (container %s)" % cont["state"]}}
+
+    # current run = since the last boot marker; the run before it = calibration
+    boot_idx = [i for i, (_, b) in enumerate(events)
+                if "entrypoint: first-boot stages" in b]
+    if boot_idx:
+        cur_i = boot_idx[-1]
+        prev_i = boot_idx[-2] if len(boot_idx) > 1 else 0
+        cur = events[cur_i:]
+        prev = events[prev_i:cur_i]
+    else:
+        cur, prev = events, []
+
+    hits = _scan_hits(cur)
+
+    # per-phase calibration: previous in-log run > cached measurement > default
+    fp = _container_fingerprint(cont["name"])
+    # SPEC=mtp boots run a 2nd, much shorter shard pass (the MTP/draft head) between
+    # the main weights and torch.compile; the draft pill only exists once that pass is
+    # visible (its 0% bar or its 'took' line), so ask for the draft phase up front.
+    try:
+        fpd = json.loads(fp) if isinstance(fp, str) and fp else {}
+    except Exception:
+        fpd = {}
+    expect_draft = str(fpd.get("SPEC", "")).lower() == "mtp"
+    phases = _build_phases(hits, expect_draft)
+    prev_phases = _build_phases(_scan_hits(prev), expect_draft) if prev else []
+    cached = _bootcal_load(fp)
+    prev_meas = {p["key"]: p["dur"] for p in prev_phases if p["dur"] is not None}
+    calmap, calsrc = {}, {}
+    for k in BOOT_PHASE_ORDER:
+        if k in prev_meas:
+            calmap[k], calsrc[k] = prev_meas[k], "prev-run"
+        elif k in cached:
+            calmap[k], calsrc[k] = cached[k], "cache"
+        else:
+            calmap[k], calsrc[k] = BOOT_PHASE_DEFAULTS[k], "default"
+    cal_summary = ("previous run in this log" if prev_meas
+                  else "cached measurements" if cached else "built-in defaults")
+
+    # run state — ground truth, in priority order:
+    #   1) a fatal marker in this run's window                    -> failed
+    #   2) 'Application startup complete' / 'Started server process' in window
+    #   3) docker's own healthcheck healthy (curl /health 200)   -> ready
+    #      (long-lived containers lose their boot lines from the log window,
+    #       but the healthcheck is exactly the "model loaded and serving" verdict)
+    #   4) exited/dead without a ready signal                     -> stopped (user stop)
+    #   5) running/created, or healthcheck still warming up      -> starting
+    fatal_ts = hits["fatal"][0][0] if hits["fatal"] else None
+    complete_ts = hits["complete"][-1] if hits["complete"] else None
+    server_ts = hits["server"][-1] if hits["server"] else None
+    ready_ts = complete_ts if complete_ts is not None else server_ts
+    now = time.time()
+    health = (cont.get("health") or "").lower()
+    if fatal_ts is not None and (ready_ts is None or fatal_ts > ready_ts):
+        state = "failed"
+    elif ready_ts is not None:
+        state = "ready"
+    elif health == "healthy":
+        state = "ready"
+        ready_ts = None  # exact moment unknown: the complete line left the log window
+    elif cont["state"] in ("running", "created", "restarting"):
+        state = "starting"
+    else:
+        state = "stopped"
+
+    now_pct = fatal_ts if state == "failed" else now
+
+    # Overall progress = the WHOLE boot, 0 -> 100% (from "Start" to "Model loaded"):
+    #   total = the expected duration of every phase of the boot, INCLUDING the
+    #           phases that have not started yet, so the denominator is fixed for
+    #           the whole boot (a phase closing or a new one starting can no longer
+    #           resize it, and the bar can never jump backwards because of it)
+    #   base  = measured durations of finished phases + the in-flight fraction of
+    #           the active one (its real N% from the log where available, else
+    #           elapsed time over its estimate)
+    n_bars = len(hits.get("load0") or [])
+    total = 0.0
+    for k in BOOT_PHASE_ORDER:
+        if k == "draft" and not (n_bars > 1 or expect_draft):
+            continue  # this boot has no 2nd shard pass (MTP/draft head) - drop its estimate
+        total += max(1.0, calmap.get(k, 10.0))
+    base = 0.0
+    for p in phases:
+        if p["t0"] is None:
+            continue
+        exp = max(1.0, calmap.get(p["key"], 10.0))
+        if p["t1"] is not None:
+            base += p["dur"] if p["dur"] is not None else exp
+        else:
+            if p.get("progress"):
+                f = min(1.0, p["progress"]["pct"] / 100.0)
+            else:
+                f = min(1.0, max(0.0, (now_pct - p["t0"]) / exp))
+            base += f * exp
+    pct = 100.0 * base / total if total > 0 else (100.0 if state == "ready" else 0.0)
+
+    # A stopped container that never became ready: non-zero exit = failed boot,
+    # clean exit 0 = user stop (reset the bar for the next boot).
+    last_ev = events[-1][0]
+    boot0 = hits["boot"][0] if hits["boot"] else None
+    if state == "stopped":
+        m = re.search(r"Exited \((\d+)\)", cont.get("status") or "")
+        code = m.group(1) if m else None
+        if code == "0":
+            pct = 0.0
+        else:
+            state = "failed"
+            if not hits["fatal"]:
+                hits["fatal"].append((last_ev, "container exited with code %s" % (code or "?")))
+
+    # Monotonicity guard: the displayed % never moves backwards during a boot
+    # (estimates get replaced by measurements as phases close; keep the max).
+    pkey = cont.get("name") or "?"
+    rec = _pct_state.get(pkey)
+    if rec is None or rec.get("boot") != boot0:
+        rec = {"boot": boot0, "pct": 0.0}
+        _pct_state[pkey] = rec
+    if state == "ready":
+        pct = 100.0  # a ready server has, by definition, finished the bar
+        rec["pct"] = 100.0
+    elif state == "stopped" and pct == 0.0:
+        _pct_state.pop(pkey, None)
+    else:
+        pct = max(pct, rec["pct"])
+        rec["pct"] = pct
+    if len(_pct_state) > 64:
+        for k in list(_pct_state)[:len(_pct_state) - 64]:
+            del _pct_state[k]
+    out_phases = []
+    for p in phases:
+        exp = calmap.get(p["key"])
+        d = {"key": p["key"], "label": p["label"], "t0": p["t0"], "t1": p["t1"],
+             "dur": p["dur"], "expected": round(exp, 1), "src": calsrc.get(p["key"]),
+             "progress": p.get("progress")}
+        if p["t1"] is not None and p["t0"] is not None:
+            d["status"] = "done"
+        elif state == "ready":
+            # ready established without this phase's end marker (truncated
+            # window) — done, duration unknown
+            d["status"] = "done"
+        elif p["t0"] is not None:
+            d["status"] = "active"
+            end_ref = ready_ts or fatal_ts or last_ev
+            d["elapsed"] = round(min(now_pct, end_ref) - p["t0"], 1)
+            if state != "failed" and d["elapsed"] > 1.3 * exp:
+                d["overrun"] = True
+        else:
+            d["status"] = "pending"
+        out_phases.append(d)
+    if state == "failed" and fatal_ts is not None:
+        fail_phase = None
+        for p in phases:
+            if p["t0"] is not None and p["t1"] is not None and abs(p["t1"] - fatal_ts) <= 1.0:
+                fail_phase = p
+        if fail_phase is None:
+            for p in phases:
+                if p["t0"] is not None and p["t1"] is None and p["t0"] <= fatal_ts:
+                    fail_phase = p
+        if fail_phase is not None:
+            for d in out_phases:
+                if d["key"] == fail_phase["key"]:
+                    d["status"] = "fail"
+
+    run = {
+        "state": state,
+        "pct": pct,
+        "started": boot0,
+        "lastTs": last_ev,
+        "readyAt": ready_ts,
+        "bootDur": round(ready_ts - boot0, 1) if (state == "ready" and boot0 and ready_ts) else None,
+        "elapsed": round(min(now_pct, (ready_ts or last_ev)) - boot0, 1)
+                   if (state in ("starting", "failed") and boot0) else None,
+        "totalEst": (round(total, 1) if state in ("starting", "failed") and total > 0 else None),
+        "calSrc": cal_summary,
+        "phases": out_phases,
+        "errors": [b[:300] for _, b in hits["fatal"][-6:]] if state == "failed" else [],
+    }
+    if state == "ready" and ready_ts is None:
+        run["note"] = ("docker healthcheck: healthy — model loaded and serving "
+                       "(boot-complete lines no longer in the log window)")
+    if state == "ready" and boot0:
+        meas = {p["key"]: p["dur"] for p in phases if p["dur"] is not None}
+        if meas:
+            _bootcal_save(fp, meas)
+    return {"ok": True, "docker": True, "container": cont, "run": run}
+
 
 # ---------------------------------------------------------------- http
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -596,6 +1194,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "health": probe_health(port),
                         "docker": docker_available(),
                         "mode": "unknown"})
+        elif p == "/api/bootlog":
+            try:
+                tail = max(500, min(4000, int(qs.get("tail", "3000") or 3000)))
+            except (ValueError, TypeError):
+                tail = 3000
+            self._json(boot_progress(tail))
         elif p == "/api/backups":
             self._json({"ok": True, "backups": list_backups()})
         elif p == "/api/raw":

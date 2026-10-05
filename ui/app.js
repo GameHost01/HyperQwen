@@ -222,13 +222,14 @@ async function doAction(name, btn) {
   if (name === "down" && !confirm("Stop the HyperQwen server?")) return;
   btn.disabled = true;
   $("#actionOut").innerHTML = "<p class='muted'>running: " + esc(name) + " …</p>";
+  let j = null;
   try {
     const r = await fetch("/api/action", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: name, confirm: name === "down" }),
     });
-    const j = await r.json();
+    j = await r.json();
     if (j.ok) {
       $("#actionOut").innerHTML = "<pre>" + esc(j.out || "(no output)") + "</pre>";
     } else {
@@ -240,6 +241,14 @@ async function doAction(name, btn) {
     $("#actionOut").innerHTML = "<div class='warn'><span class='x'>!</span>" + esc(e.message) + "</div>";
   } finally {
     btn.disabled = false;
+    if (j && j.ok) {
+      if (name === "up-single" || name === "up-batch") bootPoll(); // start tracking the new boot
+      if (name === "down") {                                       // container is gone again
+        stopBootPoll();
+        boot = null;
+        renderBoot({ run: { state: "stopped" } });
+      }
+    }
     pollStatus();
   }
 }
@@ -497,6 +506,135 @@ function toggleVramPanel() {
   }
 }
 
+/* ================================================================
+   STARTUP PROGRESS
+   Time-based bar calibrated by ui/serve.py from the serve container's
+   timestamped docker log (GET /api/bootlog). Bar width = elapsed /
+   estimated total. A new boot re-calibrates on the fly: measured phases
+   replace their estimates, and the weight/draft/CUDA phases show the real
+   N% from the log. Polls every 2 s while a boot is in progress, then stops
+   (the 15 s status poll keeps the header dot).
+   ================================================================ */
+
+let boot = null;
+let bootTimer = null;
+
+function stopBootPoll() {
+  if (bootTimer) clearTimeout(bootTimer);
+  bootTimer = null;
+}
+
+function bootPoll() {
+  api("/api/bootlog").then((j) => {
+    boot = j;
+    renderBoot(j);
+    if (j.run && j.run.state === "starting") {
+      stopBootPoll();
+      bootTimer = setTimeout(bootPoll, 2000);
+    }
+  }).catch(() => {
+    /* settings-server window went away — the 15 s status poll will notice */
+  });
+}
+
+function fmtDur(s) {
+  if (s == null || s === undefined || isNaN(s)) return "—";
+  s = Math.max(0, Math.round(s));
+  const m = Math.floor(s / 60);
+  return m ? m + "m" + (s % 60 ? (s % 60) + "s" : "") : s + "s";
+}
+
+function fmtUtc(t) {
+  if (!t) return "";
+  const d = new Date(t * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" + p(d.getUTCSeconds());
+}
+
+function progText(p) {
+  if (!p) return "";
+  return p.kind === "shards" ? "shard " + p.i + "/" + p.n
+       : p.kind === "steps" ? "step " + p.i + "/" + p.n : "";
+}
+
+function renderBoot(j) {
+  const run = j.run || {};
+  const st = run.state || "stopped";
+  const title = $("#bootTitle"), meta = $("#bootMeta"),
+        fill = $("#bootFill"), pctEl = $("#bootPct"),
+        phasesEl = $("#bootPhases"), errEl = $("#bootErrors");
+  if (!title || !meta || !fill || !pctEl || !phasesEl || !errEl) return;
+
+  const pct = Math.max(0, Math.min(100, run.pct || 0));
+  fill.style.width = pct + "%";
+  fill.className = "boot-fill" + (st === "ready" ? " ok" : st === "failed" ? " bad" : "");
+
+  const port = state.port || "18020";
+  let cls = "", metaTxt = "";
+  if (st === "ready") {
+    title.textContent = "Model loaded — server ready on port " + port;
+    cls = "ok";
+    if (run.bootDur != null) metaTxt = "boot took " + fmtDur(run.bootDur);
+    if (run.readyAt) metaTxt += " · ready " + fmtUtc(run.readyAt) + " UTC";
+    if (run.note) metaTxt += (metaTxt ? " · " : "") + run.note;
+  } else if (st === "failed") {
+    title.textContent = "Boot failed";
+    cls = "bad";
+    if (run.elapsed != null) metaTxt = fmtDur(run.elapsed) + " elapsed";
+  } else if (st === "starting") {
+    const phAll = run.phases || [];
+    const a = phAll.find((p) => p.status === "active" || p.status === "fail");
+    const ai = a ? phAll.indexOf(a) : -1;
+    title.textContent = a
+      ? "Starting — " + a.label + (ai >= 0 ? " (step " + (ai + 1) + " of " + phAll.length + ")" : "")
+          + (a.progress ? " · " + progText(a.progress) : "")
+      : "Starting";
+    cls = "run";
+    if (run.elapsed != null) metaTxt = fmtDur(run.elapsed) + " elapsed";
+    if (run.totalEst != null) metaTxt += " · est. total " + fmtDur(run.totalEst);
+    if (run.note) metaTxt += (metaTxt ? " · " : "") + run.note;
+  } else if (st === "stopped") {
+    title.textContent = "Server stopped";
+    metaTxt = "press “Start” above — the bar tracks the boot in real time";
+  } else if (st === "no-docker") {
+    title.textContent = "Docker is not running";
+  } else if (st === "unknown") {
+    title.textContent = "Status unknown" + (run.error ? " — " + run.error : "");
+  }
+  title.className = "boot-title " + cls;
+
+  if (run.calSrc && (st === "starting" || st === "failed" || st === "ready"))
+    metaTxt += (metaTxt ? " · " : "") + "calibrated: " + run.calSrc;
+  meta.textContent = metaTxt;
+
+  pctEl.textContent =
+    st === "ready" ? "100% — the model is loaded and serving"
+    : st === "starting" ? Math.floor(pct) + "% of the whole boot (start → model loaded; per-step progress is in the pills below)"
+    : st === "failed" ? "frozen at " + Math.floor(pct) + "%" : "";
+
+  const pills = [];
+  for (const p of (run.phases || [])) {
+    const cls2 = "boot-phase " +
+      (p.status === "done" ? "done" : p.status === "active" ? "active" : p.status === "fail" ? "fail" : "");
+    let txt = p.label;
+    if (p.status === "done") {
+      txt = "✓ " + p.label + (p.dur != null ? " " + fmtDur(p.dur) : "");
+    } else if (p.status === "active" || p.status === "fail") {
+      txt = (p.status === "fail" ? "✗ " : "▸ ") + p.label;
+      if (p.progress) txt += " · " + progText(p.progress) + " " + p.progress.pct + "%";
+      else if (p.elapsed != null && p.expected != null)
+        txt += " · " + fmtDur(p.elapsed) + " / ~" + fmtDur(p.expected) + " (est.)";
+      if (p.overrun) txt += " — running longer than expected";
+    }
+    pills.push("<span class='" + cls2 + "'>" + esc(txt) + "</span>");
+  }
+  phasesEl.innerHTML = pills.join("");
+
+  errEl.innerHTML = (run.errors || []).slice(0, 4)
+    .map((e) => "<div class='boot-err'>" + esc(e) + "</div>")
+    .join("");
+}
+
 /* ------------------------------------------------ init */
 function init() {
   $("#saveBtn").onclick = save;
@@ -513,6 +651,7 @@ function init() {
   loadAll().then(() => {
     pollStatus();
     loadVram();
+    bootPoll();
   });
   setInterval(pollStatus, 15000);
 }

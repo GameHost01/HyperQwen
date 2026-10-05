@@ -20,7 +20,15 @@ only the Python standard library.
 - **Settings groups** — every real .env knob, with plain-English help text.
   Changing a field marks it; **Save changes** writes them to .env.
 - **Server card** — Start single / Start batch / Stop (docker compose),
-  status (ps), logs, and a health dot in the top bar.
+  status (ps), logs, and a health dot in the top bar. **Stop** tears down
+  every profile service (single, batch, solo) plus the prepare container.
+- **Startup progress** — while a serve container is starting, a bar shows
+  the WHOLE boot 0→100% (Start → "Model loaded"), and phase pills below it
+  show each step's own 0-100% (Verifying, Engine init, Loading weights,
+  Loading draft head for MTP, torch.compile, KV cache, CUDA graphs,
+  Server start). Phase durations are calibrated from your real boots and
+  re-measured on every successful start (ui/.bootcal.json). A killed/failed
+  boot turns the bar red with the error.
 - **API key** — "Generate new API key" writes a fresh random key to .env.
 - **Backups** — every save first makes a timestamped copy
   (.env.bak-YYYYmmdd-HHMMSS next to .env). Click **restore** on any to go

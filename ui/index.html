@@ -135,6 +135,31 @@
   .vram-table .num{text-align:right;font-family:var(--mono)}
   .vram-bar{height:5px;border-radius:3px;background:var(--chip);margin-top:2px;overflow:hidden}
   .vram-bar-fill{height:100%;border-radius:3px;transition:width .3s}
+
+  /* ---- startup progress (time-based bar, calibrated from the timestamped docker log) ---- */
+  .boot-wrap{margin-top:14px;border:1px solid var(--line);border-radius:10px;
+    background:var(--panel2);padding:12px 14px}
+  .boot-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+  .boot-title{font-size:13.5px;font-weight:650;color:var(--muted)}
+  .boot-title.ok{color:var(--ok)}
+  .boot-title.bad{color:var(--bad)}
+  .boot-title.run{color:var(--acc2)}
+  .boot-meta{font-size:11.5px;color:var(--muted);font-family:var(--mono)}
+  .boot-bar{height:10px;border-radius:5px;background:var(--chip);margin-top:10px;overflow:hidden}
+  .boot-fill{height:100%;width:0%;border-radius:5px;background:var(--acc);transition:width .5s ease}
+  .boot-fill.ok{background:var(--ok)}
+  .boot-fill.bad{background:var(--bad)}
+  .boot-pct{font-size:11.5px;color:var(--muted);margin-top:6px;font-family:var(--mono)}
+  .boot-phases{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+  .boot-phase{font-size:11px;color:var(--muted);background:var(--chip);border:1px solid var(--line);
+    border-radius:20px;padding:2px 10px;font-family:var(--mono);white-space:nowrap}
+  .boot-phase.active{color:var(--txt);border-color:var(--acc)}
+  .boot-phase.done{color:var(--ok)}
+  .boot-phase.fail{color:#fff;background:var(--bad);border-color:var(--bad)}
+  .boot-errors{margin-top:10px}
+  .boot-err{font-family:var(--mono);font-size:11.5px;color:#ffb4ad;
+    background:rgba(229,83,75,.08);border:1px solid rgba(229,83,75,.35);
+    border-radius:8px;padding:6px 10px;margin-top:6px;white-space:pre-wrap;word-break:break-all}
 </style>
 </head>
 <body>
@@ -174,6 +199,16 @@
         <button class="btn bad ghost" data-act="down">Stop</button>
         <button class="btn ghost" data-act="ps">Status (ps)</button>
         <button class="btn ghost" data-act="logs">Logs</button>
+      </div>
+      <div class="boot-wrap" id="bootWrap">
+        <div class="boot-head">
+          <span class="boot-title" id="bootTitle">Server</span>
+          <span class="boot-meta" id="bootMeta"></span>
+        </div>
+        <div class="boot-bar"><div class="boot-fill" id="bootFill"></div></div>
+        <div class="boot-pct" id="bootPct"></div>
+        <div class="boot-phases" id="bootPhases"></div>
+        <div class="boot-errors" id="bootErrors"></div>
       </div>
       <div id="actionOut"></div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:14px">
