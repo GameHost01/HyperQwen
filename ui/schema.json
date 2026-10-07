@@ -6,7 +6,7 @@
 
       "title": "Inference defaults (sampling)",
 
-      "blurb": "Server-level defaults for how the model samples. They apply only to requests that do not send their own value - a per-request temperature / top_p / top_k / min_p / penalty always wins. Leave a field blank to keep the model's own default (Qwen3.8: temperature 0.7, top_p 0.9, top_k 20, min_p 0, no penalties). Restart the server to apply.",
+      "blurb": "Server-level defaults for how the model samples. They apply only to requests that do not send their own value - a per-request temperature / top_p / top_k / min_p / penalty always wins, except the max output token cap, which also limits requests that send their own max_tokens (the smaller of the two applies). Leave a field blank to keep the model's own default (Qwen3.8: temperature 1.0, top_p 0.95, top_k 20, min_p 0, no penalties). Restart the server to apply.",
 
       "fields": [
 
@@ -18,13 +18,13 @@
 
           "type": "float",
 
-          "default": "0.7",
+          "default": "1.0",
 
           "min": 0,
 
           "max": 2,
 
-          "desc": "Randomness of the answer: 0 = deterministic, higher = more varied. 0.7 = model default."
+          "desc": "Randomness of the answer: 0 = deterministic, higher = more varied. 1.0 = model default."
 
         },
 
@@ -36,13 +36,13 @@
 
           "type": "float",
 
-          "default": "0.9",
+          "default": "0.95",
 
           "min": 0,
 
           "max": 1,
 
-          "desc": "Draw from the smallest set of tokens reaching this cumulative probability. 0.9 = model default."
+          "desc": "Draw from the smallest set of tokens reaching this cumulative probability. 0.95 = model default."
 
         },
 
@@ -115,6 +115,24 @@
           "max": 2,
 
           "desc": "Multiplicative penalty for tokens already used. 1.0 = off; 1.05-1.2 fights repetition, past ~1.2 starts distorting English."
+
+        },
+
+        {
+
+          "key": "MAX_NEW_TOKENS",
+
+          "label": "Max output tokens (default)",
+
+          "type": "int",
+
+          "default": "32768",
+
+          "min": 1,
+
+          "max": 262144,
+
+          "desc": "Server-wide cap on answer length in tokens. Unlike the other sampling fields, this one also limits requests that send their own max_tokens - the smaller of the two applies (answers ending in finish_reason 'length' have hit it). Leave blank for no cap - the answer can then run until it fills the whole context."
 
         }
 
@@ -586,7 +604,8 @@
         "INT8_LAYERS": "mlp",
         "MAX_SEQS": "64",
         "MAX_LEN": "150000",
-        "GPU_UTIL": "0.95"
+        "GPU_UTIL": "0.95",
+        "MAX_NEW_TOKENS": ""
       },
       "desc": "API backend / many concurrent. 64 slots, 150k context, int8 speed."
     },
@@ -606,7 +625,8 @@
         "INT8_LAYERS": "",
         "MAX_SEQS": "8",
         "MAX_LEN": "65536",
-        "GPU_UTIL": "0.93"
+        "GPU_UTIL": "0.93",
+        "MAX_NEW_TOKENS": ""
       },
       "desc": "One/few people chatting. 64k context, 8 slots, fastest default."
     },
@@ -626,7 +646,8 @@
         "INT8_LAYERS": "",
         "MAX_SEQS": "",
         "MAX_LEN": "",
-        "GPU_UTIL": "0.93"
+        "GPU_UTIL": "0.93",
+        "MAX_NEW_TOKENS": ""
       },
       "desc": "When answers quote the prompt (code edits, RAG, translation). 4 slots, 56k."
     },
@@ -646,7 +667,8 @@
         "INT8_LAYERS": "",
         "MAX_SEQS": "8",
         "MAX_LEN": "150000",
-        "GPU_UTIL": "0.93"
+        "GPU_UTIL": "0.93",
+        "MAX_NEW_TOKENS": ""
       },
       "desc": "150k context, ~95-100 tok/s."
     },
@@ -666,7 +688,8 @@
         "INT8_LAYERS": "",
         "MAX_SEQS": "8",
         "MAX_LEN": "200000",
-        "GPU_UTIL": "0.93"
+        "GPU_UTIL": "0.93",
+        "MAX_NEW_TOKENS": ""
       },
       "desc": "200k+ context via KVarN. Slower past ~100k, for very long docs."
     }

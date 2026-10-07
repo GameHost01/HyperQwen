@@ -95,7 +95,7 @@ resolve_effective_config() {
     echo "[effective-config] REASONING_EFFORT=${REASONING_EFFORT:-<blank: model default xhigh>} REASONING_BUDGET=${REASONING_BUDGET:-<blank: no cap>}"
     local _inf
 
-    for _inf in TEMPERATURE TOP_P TOP_K MIN_P PRESENCE_PENALTY REPETITION_PENALTY; do
+    for _inf in TEMPERATURE TOP_P TOP_K MIN_P PRESENCE_PENALTY REPETITION_PENALTY MAX_NEW_TOKENS; do
 
       if [ -n "${!_inf:-}" ]; then
 
@@ -111,35 +111,45 @@ resolve_effective_config() {
 
 # build_sampling_args: TEMPERATURE / TOP_P / TOP_K / MIN_P / PRESENCE_PENALTY /
 
-# REPETITION_PENALTY from .env -> ONE --override-generation-config JSON flag for
+# REPETITION_PENALTY / MAX_NEW_TOKENS from .env -> ONE --override-generation-config
 
-# `vllm serve`. Blank value = key omitted (the model's own generation_config default
+# JSON flag for `vllm serve`. Blank value = key omitted (the model's own generation_config
 
-# applies: Qwen3.8 = 0.7 / 0.9 / 20 / 0 / no penalties). Per-request sampling values
+# default applies: Qwen3.8 = 1.0 / 0.95 / 20 / 0 / no penalties). Per-request values
 
-# still win over these server defaults; a user's EXTRA_ARGS still wins over this flag.
+# still win over these defaults, except the max_new_tokens cap, which also bounds a
 
-# Non-numeric or out-of-range values are dropped with a stderr note, never passed on.
+# per-request max_tokens; EXTRA_ARGS still wins over this flag; bad values are dropped with a note.
 
 build_sampling_args() {
 
   SAMPLING_ARGS=()
 
-  local _k _v _j _json=""
+  local _k _v _j _json="" _probe_out
 
-  for _k in TEMPERATURE TOP_P TOP_K MIN_P PRESENCE_PENALTY REPETITION_PENALTY; do
+  for _k in TEMPERATURE TOP_P TOP_K MIN_P PRESENCE_PENALTY REPETITION_PENALTY MAX_NEW_TOKENS; do
 
     _v=${!_k:-}
 
     [ -n "$_v" ] || continue
 
-    if [ "$_k" = TOP_K ]; then
+    if [ "$_k" = TOP_K ] || [ "$_k" = MAX_NEW_TOKENS ]; then
 
       printf '%s' "$_v" | grep -Eq '^[0-9]+$' || { echo "resolve_config: sampling: $_k=$_v ignored (need a non-negative integer)" >&2; continue; }
 
       _v=$((10#$_v))
 
-      [ "$_v" -le 99999 ] || { echo "resolve_config: sampling: $_k=$_v ignored (max 99999)" >&2; continue; }
+      if [ "$_k" = TOP_K ]; then
+
+        [ "$_v" -le 99999 ] || { echo "resolve_config: sampling: $_k=$_v ignored (max 99999)" >&2; continue; }
+
+      else
+
+        [ "$_v" -ge 1 ] || { echo "resolve_config: sampling: $_k=$_v ignored (min 1)" >&2; continue; }
+
+        [ "$_v" -le 262144 ] || { echo "resolve_config: sampling: $_k=$_v ignored (max 262144)" >&2; continue; }
+
+      fi
 
     else
 
@@ -173,6 +183,8 @@ build_sampling_args() {
 
       REPETITION_PENALTY) _j=repetition_penalty ;;
 
+      MAX_NEW_TOKENS) _j=max_new_tokens ;;
+
     esac
 
     _json="${_json:+$_json,}\"$_j\":$_v"
@@ -180,11 +192,17 @@ build_sampling_args() {
   done
 
   if [ -n "$_json" ]; then
-    if venv/bin/vllm serve --help 2>&1 | grep -q 'override-generation-config'; then
+    # vLLM 0.30+: plain --help no longer lists engine args, so probe the
+    # per-flag help first (exit 0 = flag is registered); on older vLLM builds that
+    # probe errors and we fall through to the classic plain --help grep below.
+    if _probe_out=$(venv/bin/vllm serve --help=override-generation-config 2>&1) \
+        && printf '%s\n' "$_probe_out" | grep -q 'override-generation-config'; then
+      SAMPLING_ARGS=(--override-generation-config "{$_json}")
+    elif venv/bin/vllm serve --help 2>&1 | grep -q 'override-generation-config'; then
       SAMPLING_ARGS=(--override-generation-config "{$_json}")
     else
       echo "resolve_config: sampling: this vllm build has no --override-generation-config, so the sampling values you set cannot be applied (JSON: {$_json})." >&2
-      echo "resolve_config: sampling: leave the 6 sampling values blank in the UI, or use an image whose vllm supports the flag, then restart." >&2
+      echo "resolve_config: sampling: leave the 7 sampling values blank in the UI, or use an image whose vllm supports the flag, then restart." >&2
       exit 97
     fi
   fi
