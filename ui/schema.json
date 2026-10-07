@@ -1,6 +1,128 @@
 {
   "groups": [
     {
+
+      "id": "inference",
+
+      "title": "Inference defaults (sampling)",
+
+      "blurb": "Server-level defaults for how the model samples. They apply only to requests that do not send their own value - a per-request temperature / top_p / top_k / min_p / penalty always wins. Leave a field blank to keep the model's own default (Qwen3.8: temperature 0.7, top_p 0.9, top_k 20, min_p 0, no penalties). Restart the server to apply.",
+
+      "fields": [
+
+        {
+
+          "key": "TEMPERATURE",
+
+          "label": "Temperature",
+
+          "type": "float",
+
+          "default": "0.7",
+
+          "min": 0,
+
+          "max": 2,
+
+          "desc": "Randomness of the answer: 0 = deterministic, higher = more varied. 0.7 = model default."
+
+        },
+
+        {
+
+          "key": "TOP_P",
+
+          "label": "Top-p (nucleus)",
+
+          "type": "float",
+
+          "default": "0.9",
+
+          "min": 0,
+
+          "max": 1,
+
+          "desc": "Draw from the smallest set of tokens reaching this cumulative probability. 0.9 = model default."
+
+        },
+
+        {
+
+          "key": "TOP_K",
+
+          "label": "Top-k",
+
+          "type": "int",
+
+          "default": "20",
+
+          "min": 0,
+
+          "max": 100,
+
+          "desc": "Keep only the k most likely tokens. 0 disables the filter; 20 = model default."
+
+        },
+
+        {
+
+          "key": "MIN_P",
+
+          "label": "Min-p",
+
+          "type": "float",
+
+          "default": "0.0",
+
+          "min": 0,
+
+          "max": 1,
+
+          "desc": "Drop tokens whose probability is below min-p times the top token's. 0 = off; 0.05-0.1 trims long-tail repetition."
+
+        },
+
+        {
+
+          "key": "PRESENCE_PENALTY",
+
+          "label": "Presence penalty",
+
+          "type": "float",
+
+          "default": "0.0",
+
+          "min": -2,
+
+          "max": 2,
+
+          "desc": "Flat penalty for topics already in the answer; pushes toward new material. 0 = off."
+
+        },
+
+        {
+
+          "key": "REPETITION_PENALTY",
+
+          "label": "Repetition penalty",
+
+          "type": "float",
+
+          "default": "1.0",
+
+          "min": 0,
+
+          "max": 2,
+
+          "desc": "Multiplicative penalty for tokens already used. 1.0 = off; 1.05-1.2 fights repetition, past ~1.2 starts distorting English."
+
+        }
+
+      ]
+
+    },
+
+    {
       "id": "mode",
       "title": "Presets & Mode",
       "blurb": "What the server is tuned to do. One GPU runs one mode at a time.",

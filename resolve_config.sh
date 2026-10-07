@@ -93,9 +93,107 @@ resolve_effective_config() {
     echo "[effective-config] MODEL=$_model PORT=$_port"
     echo "[effective-config] MAX_LEN=${MAX_LEN:-<profile default>} MAX_SEQS=${MAX_SEQS:-<profile default>}"
     echo "[effective-config] REASONING_EFFORT=${REASONING_EFFORT:-<blank: model default xhigh>} REASONING_BUDGET=${REASONING_BUDGET:-<blank: no cap>}"
+    local _inf
+
+    for _inf in TEMPERATURE TOP_P TOP_K MIN_P PRESENCE_PENALTY REPETITION_PENALTY; do
+
+      if [ -n "${!_inf:-}" ]; then
+
+        echo "[effective-config] sampling: $_inf=${!_inf}"
+
+      fi
+
+    done
+
     echo "[effective-config] VLLM_API_KEY=$_key_status api_key.txt=$_keyfile"
   } >&2
 }
+
+# build_sampling_args: TEMPERATURE / TOP_P / TOP_K / MIN_P / PRESENCE_PENALTY /
+
+# REPETITION_PENALTY from .env -> ONE --override-generation-config JSON flag for
+
+# `vllm serve`. Blank value = key omitted (the model's own generation_config default
+
+# applies: Qwen3.8 = 0.7 / 0.9 / 20 / 0 / no penalties). Per-request sampling values
+
+# still win over these server defaults; a user's EXTRA_ARGS still wins over this flag.
+
+# Non-numeric or out-of-range values are dropped with a stderr note, never passed on.
+
+build_sampling_args() {
+
+  SAMPLING_ARGS=()
+
+  local _k _v _j _json=""
+
+  for _k in TEMPERATURE TOP_P TOP_K MIN_P PRESENCE_PENALTY REPETITION_PENALTY; do
+
+    _v=${!_k:-}
+
+    [ -n "$_v" ] || continue
+
+    if [ "$_k" = TOP_K ]; then
+
+      printf '%s' "$_v" | grep -Eq '^[0-9]+$' || { echo "resolve_config: sampling: $_k=$_v ignored (need a non-negative integer)" >&2; continue; }
+
+      _v=$((10#$_v))
+
+      [ "$_v" -le 99999 ] || { echo "resolve_config: sampling: $_k=$_v ignored (max 99999)" >&2; continue; }
+
+    else
+
+      printf '%s' "$_v" | grep -Eq '^-?([0-9]+([.][0-9]+)?|[.][0-9]+)([eE][-+]?[0-9]+)?$' || { echo "resolve_config: sampling: $_k=$_v ignored (not a number)" >&2; continue; }
+
+      case "$_k" in
+
+        TEMPERATURE)        awk -v v="$_v" 'BEGIN{exit !(v>=0 && v<=2)}'  || { echo "resolve_config: sampling: $_k=$_v ignored (outside 0..2)"  >&2; continue; } ;;
+
+        TOP_P|MIN_P)        awk -v v="$_v" 'BEGIN{exit !(v>=0 && v<=1)}'  || { echo "resolve_config: sampling: $_k=$_v ignored (outside 0..1)"  >&2; continue; } ;;
+
+        PRESENCE_PENALTY)   awk -v v="$_v" 'BEGIN{exit !(v>=-2 && v<=2)}' || { echo "resolve_config: sampling: $_k=$_v ignored (outside -2..2)" >&2; continue; } ;;
+
+        REPETITION_PENALTY) awk -v v="$_v" 'BEGIN{exit !(v>=0 && v<=2)}'  || { echo "resolve_config: sampling: $_k=$_v ignored (outside 0..2)"  >&2; continue; } ;;
+
+      esac
+
+    fi
+
+    case "$_k" in
+
+      TEMPERATURE) _j=temperature ;;
+
+      TOP_P) _j=top_p ;;
+
+      TOP_K) _j=top_k ;;
+
+      MIN_P) _j=min_p ;;
+
+      PRESENCE_PENALTY) _j=presence_penalty ;;
+
+      REPETITION_PENALTY) _j=repetition_penalty ;;
+
+    esac
+
+    _json="${_json:+$_json,}\"$_j\":$_v"
+
+  done
+
+  if [ -n "$_json" ]; then
+    if venv/bin/vllm serve --help 2>&1 | grep -q 'override-generation-config'; then
+      SAMPLING_ARGS=(--override-generation-config "{$_json}")
+    else
+      echo "resolve_config: sampling: this vllm build has no --override-generation-config, so the sampling values you set cannot be applied (JSON: {$_json})." >&2
+      echo "resolve_config: sampling: leave the 6 sampling values blank in the UI, or use an image whose vllm supports the flag, then restart." >&2
+      exit 97
+    fi
+  fi
+
+  return 0
+
+}
+
+
 
 # Standalone mode (tests, CI dry-run): resolve with the ambient environment.
 # When sourced, BASH_SOURCE[0] differs from $0 and only the function loads.

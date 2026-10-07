@@ -57,3 +57,15 @@ Started: 2026-10-03 ~10:53 +0200 · Windows · cmd · cwd=G:\Apps\HyperQwen
   
 "## 2026-10-03 12:25 - save button bug"  
 "renderGroups attached input listeners via getElementById BEFORE box.appendChild(card) -> detached card -> null -> NO listeners anywhere. Presets seemed to work only because applyPreset calls setField+refreshChanged directly. Fix: appendChild before attaching listeners. node --check OK."  
+
+
+
+## 2026-10-07 ~13:30 - UI inference (sampling) defaults: TEMPERATURE / TOP_P / TOP_K / MIN_P / PRESENCE_PENALTY / REPETITION_PENALTY
+
+
+
+"Feature: the 6 keys became a first inference group in ui/schema.json (app.js is schema-driven, no app.js change); blank = the model's own generation_config default; per-request values still win; both start_qwen.sh turn non-blank values into ONE --override-generation-config via build_sampling_args() in resolve_config.sh (range-checked: non-numeric or out-of-range dropped with a stderr note), expanded before EXTRA_ARGS so a user flag still wins. serve.py validate() now range-checks every int/float field that declares min/max (fail-closed, 400 on a bad value; finite-number check). .env.example got 6 commented keys; SETTINGS_SCHEMA.md got an INFER section; the ui/README bullet is in."
+
+"Recovery incident: the earlier python applier (apply_edits.py v1) opened resolve_config.sh for write and then crashed on an anchor assert, truncating the file to 0 bytes (the earlier FileTools strReplace batch really was a no-op - it left no undo history). Restored from git: git restore -- resolve_config.sh (104-line HEAD version; the file had no uncommitted changes). Lesson: never trust a batch text-replace that reports ok without a post-write sentinel probe, and a one-shot applier must verify anchors BEFORE opening files for write."
+
+"Verification: --override-generation-config confirmed in the live image ghcr.io/syv-ai/hyperqwen:latest (vllm serve --help) and in the v0.30.0 arg_utils.py source. The user's single-user server stayed up the whole time (not touched - restart needed to pick up new keys). UI round-trip test and bash -n results: closing line follows. 2026-10-07 13:35 - test_ui.py: ALL PASS (inference group first, six keys, valid POST 200, TEMPERATURE=0.9 written, out-of-range 400, non-numeric 400, blank->commented line, .env restored byte-identical). bash -n x3 via Git Bash: BASH_N_OK. LATE IN-CONTAINER PROBE: image vllm reports 0.30.0 but its EngineArgs/CLI lack --override-generation-config (custom build; serve --help 34 lines, no usage/override) - so build_sampling_args() now feature-checks vllm serve --help and exits 97 with a clear stderr message when a sampling key is set on an unsupported build. Keys blank (the default) = flag not emitted = running server unaffected. Re-verify the flag when the image's vllm changes."

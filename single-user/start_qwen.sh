@@ -854,6 +854,18 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 source "$REPO/resolve_api_key.sh"
 resolve_vllm_key
 
+# Inference (sampling) defaults: TEMPERATURE / TOP_P / TOP_K / MIN_P / PRESENCE_PENALTY /
+
+# REPETITION_PENALTY from .env become ONE --override-generation-config flag, built by
+
+# build_sampling_args() in resolve_config.sh. Placed before EXTRA_ARGS on purpose:
+
+# a user-supplied flag still wins, as usual.
+
+build_sampling_args
+
+
+
 exec venv/bin/vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
   --host ${HOST:-0.0.0.0} --port $PORT \
@@ -872,5 +884,7 @@ exec venv/bin/vllm serve "$MODEL" \
   --enable-prompt-tokens-details \
   "${METRICS_ARGS[@]}" \
   "${TOOL_ARGS[@]}" \
+  "${SAMPLING_ARGS[@]}" \
+
   ${EXTRA_ARGS} \
   ${SSE_KEEP_ALIVE:+--sse-keep-alive-interval $SSE_KEEP_ALIVE}

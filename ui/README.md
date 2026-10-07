@@ -19,6 +19,17 @@ only the Python standard library.
   **Save**. Preset A = batch mode, B–E = single-user variants.
 - **Settings groups** — every real .env knob, with plain-English help text.
   Changing a field marks it; **Save changes** writes them to .env.
+- **Inference defaults** — temperature / top-p / top-k / min-p / presence &
+
+  repetition penalty as server-level sampling defaults. They apply only to requests
+
+  that do not send their own value (a per-request one always wins); blank keeps the
+
+  model's own default. Restart the server to apply.
+  Note: needs a vLLM build with --override-generation-config; this image's vLLM
+  0.30.0 build lacks it, so with any of these set the launcher exits 97 - unblank
+  them (or update the image) before restarting.
+
 - **Server card** — Start single / Start batch / Stop (docker compose),
   status (ps), logs, and a health dot in the top bar. **Stop** tears down
   every profile service (single, batch, solo) plus the prepare container.

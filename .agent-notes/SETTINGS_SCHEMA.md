@@ -27,6 +27,20 @@ CAPACITY:
   DFLASH_TOKENS int (verify block)         7            single 15=reproduction mode (4 slots,56k)
   DRAFT_TOKENS  int (depth)                4/3          single spec depth
   KV_MEM      int  (bytes, optional)       (5.2GiB)     single pin KV pool bytes; empty=size from GPU_UTIL
+INFER (inference/sampling defaults; server-level - a per-request value still wins; forwarded as ONE --override-generation-config, built by resolve_config.sh):
+
+  TEMPERATURE        float 0..2   0.7     both   sampling temperature (Qwen default 0.7)
+
+  TOP_P              float 0..1   0.9     both   nucleus cutoff
+
+  TOP_K              int  0..100  20      both   keep k most likely tokens (0 = off)
+
+  MIN_P              float 0..1   0       both   drop tokens below min_p x top-token prob
+
+  PRESENCE_PENALTY   float -2..2  0       both   presence penalty (0 = off)
+
+  REPETITION_PENALTY float 0..2   1       both   repetition penalty (1 = off)
+
 SPECUATION/DRAFT:
   SPEC_ATTN   int  0|1  1(fast)  single  split-KV verify attention
   DRAFT_SAMPLE enum probabilistic|greedy probabilistic single

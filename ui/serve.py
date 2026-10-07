@@ -36,6 +36,8 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from datetime import datetime, timezone
+import math
+
 
 # ---------------------------------------------------------------- paths
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # .../HyperQwen
@@ -136,13 +138,19 @@ def list_backups():
     return baks
 
 def validate(values, schema):
-    """Fail-closed: reject enum values not in the allowed set. Returns list of errors."""
+    """Fail-closed: reject enum values not in the allowed set, and any
+    int/float field that declares min/max if the value is non-numeric,
+    non-finite, or out of range. Returns a list of error strings."""
     errs = []
     opts = {}
+    num = {}
     for g in schema.get("groups", []):
         for f in g.get("fields", []):
-            if f.get("type") == "enum":
+            t = f.get("type")
+            if t == "enum":
                 opts[f["key"]] = f.get("options", [])
+            elif t in ("int", "float") and ("min" in f or "max" in f):
+                num[f["key"]] = (f.get("min"), f.get("max"))
     for k, v in values.items():
         if k in opts and v != "" and v not in opts[k]:
             errs.append(f"{k}={v!r} is not allowed (choose from {opts[k]})")
@@ -152,6 +160,21 @@ def validate(values, schema):
                 int(v)
             except ValueError:
                 errs.append(f"{k}={v!r} is not a number")
+    for k, v in values.items():
+        if k in num and v != "":
+            lo, hi = num[k]
+            try:
+                n = float(v)
+            except ValueError:
+                errs.append(f"{k}={v!r} is not a number")
+                continue
+            if not math.isfinite(n):
+                errs.append(f"{k}={v!r} must be a finite number")
+                continue
+            if lo is not None and n < float(lo):
+                errs.append(f"{k}={v!r} is below {lo}")
+            elif hi is not None and n > float(hi):
+                errs.append(f"{k}={v!r} is above {hi}")
     return errs
 
 # ---------------------------------------------------------------- VRAM calculator
