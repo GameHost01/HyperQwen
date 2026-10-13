@@ -17,3 +17,5 @@ bench/results/
 .env-backups/
 ui/.bootcal.json
 /.goose-notes
+/.agent-notes
+/.agent-notes
