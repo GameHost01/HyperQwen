@@ -245,7 +245,6 @@ function findPresetByOption(v) {
 
 function applyPreset(p) {
   for (const k of Object.keys(p.sets || {})) {
-    if (k === "MODEL") continue;  // presets never manage the model selection
     state.values[k] = p.sets[k];
     setField(k, p.sets[k]);
   }

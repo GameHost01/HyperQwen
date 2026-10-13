@@ -712,7 +712,10 @@ case "${REASONING_BUDGET:-}" in
     ;;
   *) CT_KWARGS="${CT_KWARGS:+${CT_KWARGS},}\"reasoning_budget\":${REASONING_BUDGET}" ;;
 esac
-[ -n "$CT_KWARGS" ] && EXTRA_ARGS="--chat-template-kwargs {$CT_KWARGS} ${EXTRA_ARGS}"
+# --chat-template-kwargs is not available in vLLM 0.30.0 (added in a later
+# release). Server-side reasoning-effort defaults are disabled; clients must
+# pass chat_template_kwargs per request.
+[ -n "$CT_KWARGS" ] && echo "NOTE: REASONING_EFFORT/BUDGET defaults ({$CT_KWARGS}) not applied server-side (--chat-template-kwargs needs vLLM>0.30.0); pass chat_template_kwargs per request." >&2
 
 # REQ_METRICS=1: per-request timing fields in every response plus usage on
 # every request (--enable-per-request-metrics --enable-force-include-usage,
@@ -885,6 +888,5 @@ exec venv/bin/vllm serve "$MODEL" \
   "${METRICS_ARGS[@]}" \
   "${TOOL_ARGS[@]}" \
   "${SAMPLING_ARGS[@]}" \
-
   ${EXTRA_ARGS} \
   ${SSE_KEEP_ALIVE:+--sse-keep-alive-interval $SSE_KEEP_ALIVE}

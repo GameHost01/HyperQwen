@@ -193,8 +193,8 @@ def create_custom_preset(name, sets, overwrite=False):
     clean = {}
     for k, v in (sets or {}).items():
         k = str(k)
-        if k not in known or k in SECRET_KEYS or k == "MODEL":
-            continue  # unknown knobs, secrets and MODEL are never stored in a preset
+        if k not in known or k in SECRET_KEYS:
+            continue  # unknown knobs and secrets are never stored in a preset
         clean[k] = "" if v is None else str(v)
     errs = validate(clean, schema)
     if errs:
@@ -523,6 +523,89 @@ def _kv_mib_batch(kv, gpu_util):
     We return 0 here and let the caller compute it as the remainder."""
     return 0.0
 
+def _cdiv(a, b):
+    return -(-a // b)
+
+
+def _hybrid_kv_capacity(model_dir, kv_dtype, pool_bytes, max_len, num_spec):
+    """Exact vLLM 0.30.0 hybrid (GDN linear + full attention) KV capacity in
+    tokens, derived from the model's config.json — no torch, no engine.
+
+    Mirrors vllm/v1/core/kv_cache_utils.py + platforms/interface.py:
+      * block      = 16 * cdiv(mamba_page, 16 * attn_bytes_per_token)
+      * mamba page padded to block * attn_bytes_per_token
+      * layers grouped in 17-layer buckets (min type size), groups padded
+      * num_blocks = pool // (bucket * padded_page)
+      * per-request = cdiv(max_len, block) [full-attn group]
+                      + n_mamba_groups * (2 + num_spec)  [mamba 'align' mode]
+      * capacity    = int(num_blocks / per-request * max_len)
+    Returns (capacity, detail) or (None, None) when not derivable
+    (config unreadable, non-hybrid model, or a kv dtype without a clean
+    per-token cost) — callers then fall back to the KV_BPT table estimate.
+    """
+    p = os.path.join(model_dir, "config.json")
+    if not os.path.isfile(p):
+        return None, None
+    try:
+        cfg = json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return None, None
+    tc = cfg.get("text_config") or cfg
+    lt = tc.get("layer_types") or []
+    n_full = sum(1 for t in lt if t == "full_attention")
+    n_mamba = sum(1 for t in lt if t == "linear_attention")
+    if not lt or n_full == 0 or n_mamba == 0:
+        return None, None
+    kv_bytes = {"bf16": 2, "fp8": 1}.get(kv_dtype)
+    if kv_bytes is None or max_len <= 0 or pool_bytes <= 0:
+        return None, None
+    h_kv = int(tc.get("num_key_value_heads") or 0)
+    h_dim = int(tc.get("head_dim") or 0)
+    if h_kv <= 0 or h_dim <= 0:
+        return None, None
+    attn1 = 2 * h_kv * h_dim * kv_bytes  # bytes/token per full-attn layer
+    k_hd = int(tc.get("linear_key_head_dim") or 0)
+    v_hd = int(tc.get("linear_value_head_dim") or 0)
+    k_dim = int(tc.get("linear_num_key_heads") or 0) * k_hd
+    v_dim = int(tc.get("linear_num_value_heads") or 0) * v_hd
+    # GDN state per page: conv (2*kernel-1, 2*k+v) in model dtype (bf16 here)
+    # + ssm (v_heads, v_dim, k_dim) in float16
+    conv_rows = 2 * int(tc.get("linear_conv_kernel_dim") or 4) - 1
+    real_page = conv_rows * (2 * k_dim + v_dim) * 2 + v_dim * k_hd * 2
+    if real_page <= 0:
+        return None, None
+    block = 16 * _cdiv(real_page, 16 * attn1)
+    page = block * attn1
+    n_mtp = int(tc.get("mtp_num_hidden_layers") or 0) if num_spec > 0 else 0
+    n_full += n_mtp
+    mn, mx = min(n_full, n_mamba), max(n_full, n_mamba)
+    gs = mx if mx < mn * 1.5 else mn
+
+    def _pad(n):
+        q = gs - n % gs
+        return 0 if q == gs else q
+
+    mg = (n_mamba + _pad(n_mamba)) // gs
+    fg = (n_full + _pad(n_full)) // gs
+    bpb = gs * page
+    num_blocks = pool_bytes // bpb
+    if num_blocks <= 0:
+        return None, None
+    nbr = _cdiv(max_len, block) + mg * (2 + num_spec)
+    if nbr <= 0:
+        return None, None
+    cap = int(num_blocks / nbr * max_len)
+    detail = {
+        "n_full": n_full, "n_mtp": n_mtp, "n_mamba": n_mamba,
+        "mamba_page_real": real_page, "mamba_page_padded": page,
+        "mamba_pad_pct": round(100 * (page - real_page) / real_page, 2),
+        "block": block, "group_size": gs, "n_groups": fg + mg,
+        "num_blocks": num_blocks, "blocks_per_request": nbr,
+        "concurrency": round(num_blocks / nbr, 4),
+    }
+    return cap, detail
+
+
 def compute_vram(p):
     """Compute the VRAM breakdown from full settings. Returns a dict for the API response."""
     variant   = p.get("variant", "fast")
@@ -644,13 +727,28 @@ def compute_vram(p):
     # KV token capacity (all GPUs combined) vs MAX_LEN
     # cap_total  = what the pool holds (server-start check)
     # cap_tokens = what remains after prefix-cache reservation (runtime check)
-    bpt = KV_BPT.get(kv, KV_BPT["fp8"])
-    cap_total = 0
-    if kv_total and kv_total > 0:
-        cap_total = int(kv_total * 1024 * 1024 / bpt)
+    #
+    # Hybrid models (GDN linear + full attention, e.g. Qwen3.5/3.8) have no
+    # honest bytes-per-token: the recurrent state pages dominate and vLLM
+    # equalizes/pads pages across layer groups, so the KV_BPT table below is
+    # only an estimate. When the model's config.json is readable we replicate
+    # vLLM's exact block/group math instead (verified against the live engine:
+    # 137,846 tok for the 5,397,100,000-byte pin, vLLM 0.30.0, 2026-10-13).
+    kv_capacity_detail = None
+    if mode == "single" and kv_total and kv_total > 0 and model_dir is not None:
+        pool_b = kv_mem_b if kv_mem_b > 0 else KV_PIN.get(("single", ctx))
+        if pool_b and spec in ("off", "mtp"):
+            n_spec = 0 if spec == "off" else draft_k
+            cap_tokens, kv_capacity_detail = _hybrid_kv_capacity(
+                model_dir, kv, int(pool_b), max_len, n_spec)
+            if kv_capacity_detail is not None:
+                cap_total = cap_tokens  # one block pool: pool capacity == runtime capacity
+    if kv_capacity_detail is None:
+        bpt = KV_BPT.get(kv, KV_BPT["fp8"])
+        cap_total = 0
+        if kv_total and kv_total > 0:
+            cap_total = int(kv_total * 1024 * 1024 / bpt)
         cap_tokens = int(cap_total * (1 - PREFIX_KV_FRAC)) if prefix else cap_total
-    else:
-        cap_tokens = 0
     startup_ok = (max_len <= cap_total) if (max_len > 0 and cap_total > 0) else True
     max_len_ok = (max_len <= cap_tokens) if (max_len > 0 and cap_tokens > 0) else True
 
@@ -677,6 +775,13 @@ def compute_vram(p):
         eff_max_len = {"fp8": 150000, "kvarn": 262144, "int4pth": 262144}.get(kv, 150000)
 
     notes = []
+    if kv_capacity_detail:
+        d = kv_capacity_detail
+        notes.insert(0, (
+            "KV capacity exact (vLLM hybrid math): %d GDN + %d full-attn layers (incl. %d MTP), %d-tok blocks, %d blocks → %.2f× at %s tok; mamba page padded %s%% to the attention page."
+            % (d["n_mamba"], d["n_full"], d["n_mtp"], d["block"], d["num_blocks"],
+               d["concurrency"], "{:,}".format(eff_max_len), d["mamba_pad_pct"])
+        ))
     if extra_args:
         notes.append("EXTRA_ARGS is set — raw vLLM flags can change VRAM (not modeled).")
     if int8_act:
@@ -725,6 +830,7 @@ def compute_vram(p):
         "max_len": eff_max_len,
         "max_len_ok": max_len_ok,
         "kv_capacity_tokens": cap_tokens,
+        "kv_capacity_detail": kv_capacity_detail,
         "notes": notes,
         "config": {
             "variant": variant, "spec": spec, "ctx": ctx,
