@@ -16,3 +16,4 @@ api_key.txt
 bench/results/
 .env-backups/
 ui/.bootcal.json
+/.goose-notes

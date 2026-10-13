@@ -10,6 +10,9 @@ const state = {
   baseline: {},
   meta: {},
   backups: [],
+  customPresets: [],
+  models: [],
+  modelAuto: "",
   port: "18020",
   envExists: true,
 };
@@ -53,7 +56,51 @@ function setField(key, val) {
   if (!el || !f) return;
   if (f.type === "bool") el.checked = (val === "1" || val === "true");
   else if (f.type === "secret") el.value = "";
+  else if (f.type === "model") setModelField(el, val);
   else el.value = (val && val !== "__KEEP__") ? val : "";
+}
+
+/* model select: (auto) | known models | Custom path… (reveals a text field) */
+function setModelField(sel, val) {
+  const v = (val && val !== "__KEEP__") ? val : "";
+  const custom = document.getElementById(sel.id + "_custom");
+  const known = v === "" || Array.prototype.some.call(sel.options, (o) => o.value === v);
+  sel.value = (v !== "" && !known) ? "__custom__" : v;
+  if (custom) {
+    custom.value = (v !== "" && !known) ? v : "";
+    custom.style.display = (v !== "" && !known) ? "" : "none";
+  }
+  modelInfoHtml("MODEL");
+}
+
+function modelOptionLabel(m) {
+  const bits = m.quant && m.quant.bits;
+  const q = bits ? " " + bits + "-bit" : "";
+  const rows = m.draft_rows ? " · " + Number(m.draft_rows).toLocaleString() + " draft rows" : "";
+  return m.name + " — " + (m.size_mib != null ? Math.round(m.size_mib).toLocaleString() + " MiB" : "? MiB") + q + rows;
+}
+
+function modelInfoHtml(key) {
+  const el = document.getElementById("f_" + key);
+  const info = document.getElementById("f_" + key + "_info");
+  if (!el || !info) return;
+  if (el.value === "__custom__") {
+    const cust = document.getElementById(el.id + "_custom");
+    info.textContent = "Custom path → .env: MODEL=" + ((cust && cust.value) || "(empty — launcher default)");
+    return;
+  }
+  if (el.value === "") {
+    info.textContent = "(auto): the launcher picks the -fast build if it exists, else the base model.";
+    return;
+  }
+  const m = (state.models || []).find((x) => x.model === el.value);
+  if (!m) { info.textContent = ""; return; }
+  const q = (m.quant && m.quant.bits)
+    ? m.quant.bits + "-bit (group " + m.quant.group_size + ", " + (m.quant.symmetric ? "symmetric" : "asymmetric") + ")"
+    : ((m.quant && m.quant.method) || "");
+  info.textContent = (m.size_mib != null ? Math.round(m.size_mib).toLocaleString() + " MiB on disk" : "") + (q ? " · " + q : "")
+    + " · MTP tensors: " + (m.mtp ? "yes" : "no")
+    + (m.draft_rows ? " · draft head " + Number(m.draft_rows).toLocaleString() + " rows" : "");
 }
 
 function collectValues() {
@@ -66,6 +113,9 @@ function collectValues() {
     else if (f.type === "secret") {
       const v = el.value.trim();
       out[f.key] = (v === "") ? "__KEEP__" : v;
+    } else if (f.type === "model") {
+      const cust = document.getElementById(el.id + "_custom");
+      out[f.key] = (el.value === "__custom__" ? (cust ? cust.value.trim() : "") : el.value);
     } else out[f.key] = el.value.trim();
   }
   return out;
@@ -78,10 +128,24 @@ function changedCount() {
   return n;
 }
 
+// The floppy save icon is about the PRESET, not the .env: it is live (bright
+// green) whenever the current settings differ from what the target preset
+// stores — so it stays usable after "Save changes" (which never touches
+// presets) until the preset itself is updated.
+function presetSaveable() {
+  const p = currentPresetTarget();
+  if (!p) return false;
+  const cur = collectValues();
+  const sets = p.sets || {};
+  return Object.keys(sets).some((k) => (cur[k] || "") !== (sets[k] || ""));
+}
+
 function refreshChanged() {
   const n = changedCount();
   $("#changedCount").textContent = n ? (n + " unsaved change" + (n > 1 ? "s" : "")) : "";
   $("#saveBtn").disabled = (n === 0);
+  const spb = $("#saveToPresetBtn");
+  if (spb) spb.disabled = !presetSaveable();  // dull green only when the preset already matches the settings
 }
 
 /* ------------------------------------------------ rendering */
@@ -90,24 +154,98 @@ function esc(s) {
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-function renderPresets() {
-  const box = $("#presets");
-  box.innerHTML = "";
+function presetMatches(p) {
   const cur = state.values;
-  for (const p of (state.schema.presets || [])) {
-    const b = document.createElement("button");
-    b.className = "preset";
-    const active = Object.keys(p.sets || {}).every((k) => cur[k] === p.sets[k]);
-    b.innerHTML = "<div class='t'>" + esc(p.name) +
-      (active ? " <span class='tag'>current</span>" : "") +
-      "</div><div class='d'>" + esc(p.desc || "") + "</div>";
-    b.onclick = () => applyPreset(p);
-    box.appendChild(b);
+  const sets = p.sets || {};
+  const keys = Object.keys(sets);
+  return keys.length > 0 && keys.every((k) => (cur[k] || "") === (sets[k] || ""));
+}
+
+function renderPresets() {
+  const sel = $("#presetSelect");
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = "";
+  const ph = document.createElement("option");
+  ph.value = "";
+  ph.textContent = "— pick a preset —";
+  sel.appendChild(ph);
+  let activeName = null;
+  const builtins = (state.schema && state.schema.presets) || [];
+  if (builtins.length) {
+    const grp = document.createElement("optgroup");
+    grp.label = "Built-in";
+    for (const p of builtins) {
+      const o = document.createElement("option");
+      o.value = "b:" + p.id;
+      const active = presetMatches(p);
+      o.textContent = p.name + (active ? "   ✓ current" : "");
+      grp.appendChild(o);
+      if (active) activeName = p.name;
+    }
+    sel.appendChild(grp);
   }
+  if (state.customPresets.length) {
+    const grp = document.createElement("optgroup");
+    grp.label = "Your presets";
+    for (const p of state.customPresets) {
+      const o = document.createElement("option");
+      o.value = "c:" + p.id;
+      const active = presetMatches(p);
+      o.textContent = p.name + (active ? "   ✓ current" : "");
+      grp.appendChild(o);
+      if (active) activeName = p.name;
+    }
+    sel.appendChild(grp);
+  }
+  if (prev && Array.prototype.some.call(sel.options, (o) => o.value === prev)) sel.value = prev;
+  const curEl = $("#presetCurrent");
+  if (curEl) curEl.textContent = activeName ? "matches: " + activeName : "";
+  renderSelectedCustom();
+}
+
+// The preset the row's buttons act on: the one picked in the list, or (when
+// nothing is picked) the unique one of yours that matches the current settings.
+function currentPresetTarget() {
+  const v = ($("#presetSelect") || {}).value || "";
+  if (v.startsWith("c:")) {
+    const p = state.customPresets.find((x) => x.id === v.slice(2));
+    if (p) return p;
+  }
+  const matches = state.customPresets.filter(presetMatches);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function renderSelectedCustom() {
+  const row = $("#customPresetRow");
+  const saveBtn = $("#saveToPresetBtn");
+  const delBtn = $("#deletePresetBtn");
+  const p = currentPresetTarget();
+  // the floppy (save-to-preset) and trash (delete) icons sit inline in the preset row
+  if (saveBtn) saveBtn.hidden = !p;
+  if (delBtn) delBtn.hidden = !p;
+  if (!row) return;
+  if (!p) { row.hidden = true; return; }
+  row.hidden = false;
+  const keys = Object.keys(p.sets || {});
+  const bits = keys.slice(0, 4).map((k) => k + "=" + (p.sets[k] === "" ? "off" : p.sets[k]));
+  const meta = $("#customPresetMeta");
+  const when = p.updated || p.created;
+  if (meta) meta.textContent =
+    (when ? (p.updated ? "updated " : "saved ") + when.slice(0, 10) + " — " : "") +
+    keys.length + " fields: " + bits.join("  ·  ") + (keys.length > 4 ? "  ·  …" : "");
+}
+
+function findPresetByOption(v) {
+  if (!v) return null;
+  if (v.startsWith("c:")) return state.customPresets.find((x) => x.id === v.slice(2)) || null;
+  const builtins = (state.schema && state.schema.presets) || [];
+  return builtins.find((p) => p.id === v.slice(2)) || null;
 }
 
 function applyPreset(p) {
   for (const k of Object.keys(p.sets || {})) {
+    if (k === "MODEL") continue;  // presets never manage the model selection
     state.values[k] = p.sets[k];
     setField(k, p.sets[k]);
   }
@@ -115,7 +253,103 @@ function applyPreset(p) {
   renderWarnings();
   refreshChanged();
   refreshVramLive();
-  toast("Preset applied: " + p.name + " — press Save, then Start ⚡ " + p.mode);
+  toast("Preset applied: " + p.name +
+    (p.mode ? " — press Save, then Start ⚡ " + p.mode
+            : " — press Save, then start the mode that fits"));
+}
+
+/* ------------------------------------------------ custom presets */
+async function loadCustomPresets() {
+  const r = await api("/api/presets");
+  state.customPresets = r.custom || [];
+  return state.customPresets;
+}
+
+function openPresetModal() {
+  const values = collectValues();
+  for (const k of Object.keys(values))
+    if (k === "VLLM_API_KEY" || k === "HF_TOKEN") delete values[k];  // secrets are never stored
+  $("#presetModalCount").textContent = String(Object.keys(values).length);
+  const input = $("#presetNameInput");
+  // if a custom preset is selected (or matches the current settings), pre-fill
+  // its name: re-saving under the same name offers to overwrite it (with a
+  // confirm popup) instead of dead-ending
+  const tgt = currentPresetTarget();
+  input.value = tgt ? tgt.name : "";
+  $("#presetModal").style.display = "flex";
+  setTimeout(() => { input.focus(); input.select(); }, 10);
+}
+
+function closePresetModal() {
+  $("#presetModal").style.display = "none";
+}
+
+async function savePresetFromModal() {
+  const name = $("#presetNameInput").value.trim();
+  if (!name) { toast("Give the preset a name first", "bad"); return; }
+  // same name as an existing preset -> confirm once, then overwrite it in place
+  const existing = state.customPresets.find(
+    (p) => (p.name || "").trim().toLowerCase() === name.toLowerCase());
+  if (existing &&
+      !confirm("A preset named '" + existing.name + "' already exists.\n\nOverwrite it with the current settings?")) {
+    toast("Not overwritten — pick a different name to save a new preset");
+    return;
+  }
+  if (existing) name = existing.name;  // keep the stored name (and its casing)
+  closePresetModal();
+  const btn = $("#newPresetBtn");
+  btn.disabled = true;
+  try {
+    const r = await api("/api/presets",
+      { action: "create", name: name, sets: collectValues(), overwrite: !!existing });
+    await loadCustomPresets();
+    renderPresets();
+    if (r.preset && r.preset.id) $("#presetSelect").value = "c:" + r.preset.id;
+    toast((existing ? "Saved over preset: " : "Preset saved: ") + name);
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// "Save to this preset" — overwrite the target preset in place (the one
+// picked in the list, or the unique one matching the current settings).
+async function saveToCurrentPreset() {
+  const p = currentPresetTarget();
+  if (!p) {
+    toast("No preset to save to — pick one of yours in the list, or make one first", "bad");
+    return;
+  }
+  if (!confirm("Overwrite the preset '" + p.name + "' with the current settings?\n\nIts stored settings are replaced, the name is kept. Your .env is not touched — press Save as usual to change it."))
+    return;
+  const btn = $("#saveToPresetBtn");
+  if (btn) btn.disabled = true;
+  try {
+    await api("/api/presets", { action: "create", name: p.name, sets: collectValues(), overwrite: true });
+    await loadCustomPresets();
+    renderPresets();
+    toast("Saved to preset: " + p.name);
+  } catch (e) {
+    toast(e.message, "bad");
+  } finally {
+    refreshChanged();  // re-evaluate: the preset now matches the settings, so the icon goes dull again
+  }
+}
+
+async function deleteSelectedPreset() {
+  let p = null;
+  const v = $("#presetSelect").value;
+  if (v && v.startsWith("c:")) p = state.customPresets.find((x) => x.id === v.slice(2)) || null;
+  if (!p) p = currentPresetTarget();
+  if (!p) return;
+  if (!confirm("Delete preset '" + p.name + "'?\nYour .env is not touched.")) return;
+  try {
+    await api("/api/presets", { action: "delete", id: p.id });
+    await loadCustomPresets();
+    renderPresets();
+    toast("Deleted preset: " + p.name);
+  } catch (e) { toast(e.message, "bad"); }
 }
 
 function controlFor(f) {
@@ -135,6 +369,16 @@ function controlFor(f) {
   } else if (f.type === "int" || f.type === "float") {
     h = "<input type='number' id='" + id + "' step='" + (f.type === "float" ? "0.01" : "1") +
         "' placeholder='" + esc(f.default != null ? f.default : "") + "'>";
+  } else if (f.type === "model") {
+    h = "<select id='" + id + "'>";
+    h += "<option value=''" + esc(state.modelAuto ? "(auto) — " + state.modelAuto : "(auto)") + "</option>";
+    for (const m of state.models || [])
+      h += "<option value='" + esc(m.model) + "'>" + esc(modelOptionLabel(m)) + "</option>";
+    h += "<option value='__custom__'>Custom path…</option></select>";
+    h += "<div class='model-info' id='" + id + "_info'></div>";
+    h += "<input type='text' class='model-custom' id='" + id + "_custom' spellcheck='false' "
+      + "placeholder='" + esc(f.default != null ? f.default : "") + "'>";
+
   } else {
     h = "<input type='text' id='" + id + "' placeholder='" + esc(f.default != null ? f.default : "") +
         "' spellcheck='false'>";
@@ -165,20 +409,42 @@ function renderGroups() {
     for (const f of g.fields) {
       const el = document.getElementById("f_" + f.key);
       if (el) el.addEventListener("input", onFieldInput);
+      if (f.type === "model" && el) {
+        el.addEventListener("change", onFieldInput);
+        const cust = document.getElementById("f_" + f.key + "_custom");
+        if (cust) {
+          cust.style.display = "none";
+          cust.addEventListener("input", onFieldInput);
+        }
+      }
     }
   }
   for (const k of Object.keys(state.values)) setField(k, state.values[k]);
+  modelInfoHtml("MODEL");
   renderPresets();
   renderWarnings();
   refreshChanged();
 }
 
 function onFieldInput(e) {
+  if (e.target.id === "f_MODEL_custom") {
+    state.values.MODEL = e.target.value.trim();
+    modelInfoHtml("MODEL");
+    renderWarnings(); refreshChanged(); refreshVramLive();
+    return;
+  }
   const key = e.target.id.replace(/^f_/, "");
   const f = fieldOf(key);
   if (!f) return;
   if (f.type === "bool") state.values[key] = e.target.checked ? "1" : "";
+  else if (f.type === "model") {
+    const cust = document.getElementById("f_" + key + "_custom");
+    if (e.target.value === "__custom__" && cust) cust.style.display = "";
+    else if (cust) { cust.style.display = "none"; cust.value = ""; }
+    state.values[key] = (e.target.value === "__custom__" ? (cust ? cust.value.trim() : "") : e.target.value);
+  }
   else state.values[key] = e.target.value.trim();
+  if (key === "MODEL") modelInfoHtml("MODEL");
   renderWarnings();
   refreshChanged();
   refreshVramLive();
@@ -288,6 +554,15 @@ function renderBackups() {
 }
 
 /* ------------------------------------------------ load / save */
+async function loadModels() {
+  try {
+    const r = await api("/api/models");
+    state.models = r.models || [];
+  } catch (e) { state.models = []; }
+  const fast = state.models.find((m) => /-fast$/.test(m.name)) || state.models[0];
+  state.modelAuto = fast ? fast.name : "";
+}
+
 async function loadSettings() {
   const s = await api("/api/settings");
   state.schema = s.schema;
@@ -299,10 +574,15 @@ async function loadSettings() {
   state.backups = s.backups;
   state.port = s.port;
   state.envExists = s.envExists;
+  try {
+    const pr = await api("/api/presets");
+    state.customPresets = pr.custom || [];
+  } catch (e) { state.customPresets = []; }
   $("#sub").textContent = "editing " + (state.envExists ? ".env" : "no .env found") +
     " — model port " + state.port;
   $("#keyState").textContent = isSet(s.values.VLLM_API_KEY)
     ? "set (" + (state.meta.VLLM_API_KEY || "") + ")" : "not set";
+  await loadModels();
   renderGroups();
   renderBackups();
 }
@@ -362,6 +642,7 @@ function vramParams() {
     prefill_attn:   v.PREFILL_ATTN || "",
     extra_args:     v.EXTRA_ARGS || "",
     os_vram:        v.OS_VRAM || "512",
+    model:          v.MODEL || "",
   };
 }
 
@@ -459,7 +740,13 @@ function renderVramSummary(d) {
         '<span class="val bad">' + cap + ' tok (MAX_LEN too big)</span></div>';
   }
 
-  let notesHtml = (d.notes || []).map(n => '<div class="vram-note">' + esc(n) + "</div>").join("");
+  let notesHtml = (d.notes || [])
+    .filter(n => d.weights_source !== "fallback-fast" || !/estimated from the reference fast variant/.test(n))
+    .map(n => '<div class="vram-note">' + esc(n) + "</div>").join("");
+  if (d.weights_source === "fallback-fast") {
+    notesHtml = '<div class="vram-note bad">⚠ Weights estimated from the reference fast variant' +
+      (d.model_dir ? " — '" + esc(d.model_dir) + "' could not be read" : "") + ".</div>" + notesHtml;
+  }
 
   box.innerHTML =
     '<div class="vram-stat"><span class="lbl">GPU total</span>' +
@@ -640,6 +927,21 @@ function init() {
   $("#saveBtn").onclick = save;
   $("#reloadBtn").onclick = () => loadAll().then(() => toast("Reloaded from disk"));
   $("#keygenBtn").onclick = doKeygen;
+  const sel = $("#presetSelect");
+  if (sel) sel.onchange = () => {
+    const p = findPresetByOption(sel.value);
+    if (p) applyPreset(p);
+  };
+  $("#newPresetBtn").onclick = openPresetModal;
+  $("#saveToPresetBtn").onclick = saveToCurrentPreset;
+  $("#deletePresetBtn").onclick = deleteSelectedPreset;
+  $("#presetModalCancel").onclick = closePresetModal;
+  $("#presetModalOk").onclick = savePresetFromModal;
+  $("#presetNameInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") savePresetFromModal();
+    else if (e.key === "Escape") closePresetModal();
+  });
+  $("#presetModal").onclick = (e) => { if (e.target === e.currentTarget) closePresetModal(); };
   document.querySelectorAll("[data-act]").forEach((b) => {
     b.onclick = () => doAction(b.dataset.act, b);
   });

@@ -499,13 +499,13 @@
         },
         {
           "key": "MODEL",
-          "label": "Model path",
-          "type": "text",
+          "label": "Model",
+          "type": "model",
           "default": "models/Qwen3.8-27B-W4A16-AutoRound",
           "modes": [
             "both"
           ],
-          "desc": "Path to the model. Usually leave as-is."
+          "desc": "Pick a prepared model, or enter a custom path. (auto) uses the fastest available variant — the -fast AutoRound build if present, else the base."
         },
         {
           "key": "VLLM_API_KEY",

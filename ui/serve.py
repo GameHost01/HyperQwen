@@ -137,6 +137,103 @@ def list_backups():
     baks.sort(key=lambda b: b["name"], reverse=True)
     return baks
 
+# ---------------------------------------------------------------- custom presets
+# User-made presets: a named snapshot of the known .env fields (secrets
+# excluded), stored in ui/.custom-presets.json — never in .env itself.
+
+CUSTOM_PRESETS_PATH = os.path.join(UI_DIR, ".custom-presets.json")
+_presets_lock = threading.Lock()
+
+def _custom_presets_read():
+    try:
+        with open(CUSTOM_PRESETS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and isinstance(data.get("presets"), list):
+            return data["presets"]
+    except Exception:
+        pass
+    return []
+
+def _custom_presets_write(presets):
+    with open(CUSTOM_PRESETS_PATH, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "presets": presets}, f, indent=1)
+
+def list_custom_presets():
+    """Custom presets, sanitized for the UI (secrets are never stored)."""
+    with _presets_lock:
+        presets = _custom_presets_read()
+    out = []
+    for p in presets:
+        if not isinstance(p, dict) or not (p.get("name") or "").strip() or not p.get("id"):
+            continue
+        sets = p.get("sets")
+        if not isinstance(sets, dict):
+            continue
+        out.append({"id": str(p["id"]),
+                    "name": p["name"],
+                    "sets": {str(k): ("" if v is None else str(v)) for k, v in sets.items()},
+                    "created": str(p.get("created") or ""),
+                    "updated": str(p.get("updated") or "")})
+    out.sort(key=lambda x: x["created"], reverse=True)
+    return out
+
+def create_custom_preset(name, sets, overwrite=False):
+    """Validate and store a snapshot of the current settings. (preset, error).
+
+    A name clash (case-insensitive) is an error unless overwrite is set; with
+    overwrite the existing preset is updated in place — same id, its original
+    name casing kept, new sets, and a fresh 'updated' stamp."""
+    name = (name or "").strip()
+    if not name:
+        return None, "give the preset a name"
+    if len(name) > 60:
+        return None, "preset name too long (max 60 characters)"
+    schema = json.load(open(SCHEMA_PATH, encoding="utf-8"))
+    known = {f["key"] for g in schema.get("groups", []) for f in g.get("fields", [])}
+    clean = {}
+    for k, v in (sets or {}).items():
+        k = str(k)
+        if k not in known or k in SECRET_KEYS or k == "MODEL":
+            continue  # unknown knobs, secrets and MODEL are never stored in a preset
+        clean[k] = "" if v is None else str(v)
+    errs = validate(clean, schema)
+    if errs:
+        return None, "current settings don't pass validation: " + "; ".join(errs)
+    with _presets_lock:
+        presets = _custom_presets_read()
+        for i, p in enumerate(presets):
+            if (p.get("name") or "").strip().lower() != name.lower():
+                continue
+            if not overwrite:
+                return None, "a preset named '%s' already exists — pick another name" % name
+            nid = p.get("id") or ("c" + datetime.now().strftime("%Y%m%d%H%M%S") + secrets.token_hex(2))
+            presets[i] = {"id": nid,
+                          "name": (p.get("name") or "").strip(),
+                          "sets": clean,
+                          "created": p.get("created") or "",
+                          "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+            _custom_presets_write(presets)
+            return dict(presets[i]), None
+        p = {"id": "c" + datetime.now().strftime("%Y%m%d%H%M%S") + secrets.token_hex(2),
+             "name": name,
+             "sets": clean,
+             "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        presets.append(p)
+        _custom_presets_write(presets)
+    return p, None
+
+def delete_custom_preset(pid):
+    pid = str(pid or "")
+    if not pid:
+        return False
+    with _presets_lock:
+        presets = _custom_presets_read()
+        keep = [p for p in presets if (p.get("id") or "") != pid]
+        if len(keep) == len(presets):
+            return False
+        _custom_presets_write(keep)
+    return True
+
 def validate(values, schema):
     """Fail-closed: reject enum values not in the allowed set, and any
     int/float field that declares min/max if the value is non-numeric,
@@ -236,6 +333,141 @@ def _scan_st(model_dir):
     _scan_cache[model_dir] = total
     return total
 
+# Model discovery for the settings dropdown: reads each model dir's
+# safetensors headers and config.json — no torch needed.
+
+def _scan_model_dir(model_dir):
+    """Sum tensor bytes across every non-.bak *.safetensors in model_dir.
+
+    Returns (total_bytes, visual_bytes, draft_rows, has_mtp), or None when
+    the dir is missing or holds no readable safetensors file."""
+    try:
+        files = os.listdir(model_dir)
+    except OSError:
+        return None
+    total = visual = 0
+    draft_rows = None
+    has_mtp = False
+    for f in sorted(files):
+        if not f.endswith(".safetensors") or ".bak" in f:
+            continue
+        try:
+            with open(os.path.join(model_dir, f), "rb") as fh:
+                n = struct.unpack("<Q", fh.read(8))[0]
+                hdr = json.loads(fh.read(n))
+        except (OSError, ValueError):
+            continue
+        for k, v in hdr.items():
+            if not isinstance(v, dict) or "shape" not in v:
+                continue
+            sz = _SAFETENSORS_DT.get(v.get("dtype"), 0)
+            for s in v.get("shape", []):
+                sz *= s
+            total += sz
+            if "visual" in k:
+                visual += sz
+            if k.startswith("mtp."):
+                has_mtp = True
+            if k.endswith(".weight_packed") or k.endswith(".weight") or k.endswith(".bias"):
+                k0 = k.rsplit(".", 1)[0]
+            else:
+                k0 = k
+            if k0 == "mtp.draft_lm_head" and v.get("shape"):
+                draft_rows = int(v["shape"][0])
+    return (total, visual, draft_rows, has_mtp)
+
+
+def _resolve_model_dir(model):
+    """Map a MODEL value to an existing directory, or None.
+
+    Empty mirrors single-user/select_model.sh: the fast variant when it
+    exists, else the base model.  Relative values are tried repo-relative
+    first (the .env convention), then verbatim."""
+    m = (model or "").strip()
+    if not m:
+        fast = os.path.join(MODELS_DIR, "Qwen3.8-27B-W4A16-AutoRound-fast")
+        base = os.path.join(MODELS_DIR, "Qwen3.8-27B-W4A16-AutoRound")
+        pick = fast if os.path.isdir(fast) else base
+        return pick if os.path.isdir(pick) else None
+    cands = [m] if os.path.isabs(m) else [os.path.join(REPO, m), m]
+    for c in cands:
+        if os.path.isdir(c):
+            return c
+    return None
+
+
+def _quant_summary(model_dir):
+    """Summarize the quantization groups in the model's config.json."""
+    try:
+        with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    qc = cfg.get("quantization_config") or {}
+    if qc.get("quant_method") != "compressed-tensors":
+        return {"method": qc.get("quant_method") or ""}
+    body = None
+    bits = gsizes = []
+    asymmetric = False
+    for g in (qc.get("config_groups") or {}).values():
+        w = (g or {}).get("weights") or {}
+        if w.get("num_bits") is not None:
+            bits.append(int(w["num_bits"]))
+        if w.get("group_size") is not None:
+            gsizes.append(int(w["group_size"]))
+        if not w.get("symmetric", True):
+            asymmetric = True
+        if body is None and g.get("targets") == ["Linear"]:
+            body = w
+    out = {"method": "compressed-tensors"}
+    if body is not None:
+        out["bits"] = body.get("num_bits")
+        out["group_size"] = body.get("group_size")
+        out["symmetric"] = bool(body.get("symmetric", True))
+    elif bits:
+        out["bits"] = max(bits)
+        out["group_size"] = min(gsizes) if gsizes else None
+        out["symmetric"] = not asymmetric
+    return out
+
+
+def _list_models():
+    """Models selectable in the settings UI: immediate subdirs of the models
+    dir with a config.json and at least one non-.bak *.safetensors.
+    Skips DFlash2 drafter dirs, tmp-* dirs, dot dirs and unreadable dirs."""
+    out = []
+    try:
+        entries = sorted(os.listdir(MODELS_DIR))
+    except OSError:
+        return out
+    for d in entries:
+        if d.startswith(".") or d.startswith("tmp-") or "DFlash2" in d:
+            continue
+        p = os.path.join(MODELS_DIR, d)
+        if not os.path.isdir(p):
+            continue
+        try:
+            if not os.path.isfile(os.path.join(p, "config.json")):
+                continue
+            sts = [f for f in os.listdir(p)
+                   if f.endswith(".safetensors") and ".bak" not in f]
+            if not sts:
+                continue
+        except OSError:
+            continue
+        sc = _scan_model_dir(p)
+        total, _vis, rows, has_mtp = sc if sc else (0, 0, None, False)
+        out.append({
+            "name": d,
+            "model": "models/" + d,
+            "size_mib": round(total / (1024 * 1024), 1) if total else None,
+            "quant": _quant_summary(p),
+            "mtp": has_mtp,
+            "draft_rows": rows,
+        })
+    return out
+
+
 def _w_mib(variant):
     """Model weights in MiB. Scans actual files; falls back to known values."""
     dirs = {
@@ -318,14 +550,31 @@ def compute_vram(p):
     prefill_att = (p.get("prefill_attn", "") or "").strip()
     extra_args  = (p.get("extra_args", "") or "").strip()
     os_vram     = float(p.get("os_vram", 512) or 512)
+    model       = (p.get("model", "") or "").strip()
 
     comps = []
 
     tps = f" / {gpu_count} GPUs" if gpu_count > 1 else ""
 
     # 1 — model weights (scan total includes vision; subtract if off or offloaded)
-    w = _w_mib(variant) / div
+    # Source order: scan of the selected model dir, else the reference 'fast'
+    # totals (an unknown model is never an error).
+    weights_source = "fallback-fast"
+    model_dir = _resolve_model_dir(model)
     vis_mib = _FB[variant]["vision"] / div
+    draft_rows = None
+    if model_dir is not None:
+        sc = _scan_model_dir(model_dir)
+        if sc and sc[0] > 0:
+            weights_source = "scan"
+            w = sc[0] / (1024 * 1024) / div
+            if sc[1] > 0:
+                vis_mib = sc[1] / (1024 * 1024) / div
+            draft_rows = sc[2]
+        else:
+            model_dir = None
+    if weights_source != "scan":
+        w = _w_mib(variant) / div
     if not vision or vis_off:
         w -= vis_mib
     comps.append(("Model weights (" + variant + ")" + tps, round(w, 1), "#4f8cff"))
@@ -435,11 +684,16 @@ def compute_vram(p):
     if prefill_att:
         notes.append("PREFILL_ATTN on — small activation change (not modeled).")
     if mtp_vocab and spec == "mtp":
-        notes.append("MTP_DRAFT_VOCAB=1 — 40k draft vocab slightly changes MTP head size (not modeled).")
+        if draft_rows:
+            notes.append("MTP_DRAFT_VOCAB=1 — draft head has {:,} rows (scanned from the selected model); head size impact not modeled.".format(draft_rows))
+        else:
+            notes.append("MTP_DRAFT_VOCAB=1 — custom draft vocab slightly changes MTP head size (not modeled).")
     if lookup and spec == "dflash2":
         notes.append("LOOKUP=1 — prompt lookup table, negligible VRAM.")
     if spec_attn:
         notes.append("SPEC_ATTN=1 — split-KV verify attention, no separate VRAM pool modeled.")
+    if weights_source == "fallback-fast":
+        notes.append("Weights estimated from the reference fast variant — the selected model dir could not be read.")
 
     # sort by size descending, keep Headroom last
     headroom_entry = None
@@ -451,6 +705,8 @@ def compute_vram(p):
 
     return {
         "ok": True,
+        "weights_source": weights_source,
+        "model_dir": model_dir or "",
         "gpu_total_mib": GPU_TOTAL_MIB,
         "gpu_util": gpu_util,
         "gpu_count": gpu_count,
@@ -1204,11 +1460,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "prefill_attn":   qs.get("prefill_attn", env.get("PREFILL_ATTN", "")),
                 "extra_args":     qs.get("extra_args", env.get("EXTRA_ARGS", "")),
                 "os_vram":        qs.get("os_vram", env.get("OS_VRAM", "512")),
+                "model":          qs.get("model", env.get("MODEL", "")),
             }
             try:
                 self._json(compute_vram(params))
             except Exception as e:
                 self._json({"ok": False, "error": f"vram calc: {type(e).__name__}: {e}"}, 500)
+        elif p == "/api/models":
+            try:
+                self._json({"ok": True, "models": _list_models()})
+            except Exception as e:
+                self._json({"ok": False, "error": f"model list: {type(e).__name__}: {e}"}, 500)
         elif p == "/api/status":
             text = read_env_text()
             values = parse_env(text)
@@ -1225,6 +1487,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(boot_progress(tail))
         elif p == "/api/backups":
             self._json({"ok": True, "backups": list_backups()})
+        elif p == "/api/presets":
+            self._json({"ok": True, "custom": list_custom_presets()})
         elif p == "/api/raw":
             text = read_env_text()
             active = parse_env(text)
@@ -1287,6 +1551,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             make_backup()
             shutil.copy2(src, ENV_PATH)
             self._json({"ok": True, "restored": name})
+        elif p == "/api/presets":
+            action = payload.get("action", "")
+            if action == "create":
+                p, err = create_custom_preset(payload.get("name", ""), payload.get("sets") or {},
+                                              bool(payload.get("overwrite", False)))
+                if err:
+                    return self._json({"ok": False, "error": err}, 400)
+                self._json({"ok": True, "preset": p})
+            elif action == "delete":
+                if not delete_custom_preset(payload.get("id", "")):
+                    return self._json({"ok": False, "error": "no such preset"}, 404)
+                self._json({"ok": True})
+            else:
+                self._json({"ok": False, "error": "unknown preset action"}, 400)
         elif p == "/api/action":
             name = payload.get("action", "")
             if name in DESTRUCTIVE and not payload.get("confirm"):

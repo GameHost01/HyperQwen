@@ -15,8 +15,13 @@ only the Python standard library.
 
 ## What you can do
 
-- **Presets** — A to E. Click one to fill in the matching settings, then
-  **Save**. Preset A = batch mode, B–E = single-user variants.
+- **Presets** — one dropdown: the built-in presets A–E (A = batch mode,
+  B–E = single-user variants). Pick one to fill in the matching settings,
+  then **Save**. Or make your own: **＋ Save current as preset** snapshots
+  the whole current setup in one click and pops up a naming window
+  (stored in ui/.custom-presets.json; re-apply it from the dropdown,
+  overwrite it in place with the floppy save icon, or delete it with the
+  trash icon — your .env is only touched when you press **Save**).
 - **Settings groups** — every real .env knob, with plain-English help text.
   Changing a field marks it; **Save changes** writes them to .env.
 - **Inference defaults** — temperature / top-p / top-k / min-p / presence &

@@ -14,6 +14,14 @@ cd /app
 export PATH=/app/venv/bin:$PATH
 BASE=${BASE_MODEL_DIR:-/app/models/Qwen3.8-27B-W4A16-AutoRound}
 HF_REPO=${HF_REPO:-dbirks/Qwen3.8-27B-W4A16-AutoRound}
+# MODEL_CUSTOM: MODEL is an existing dir that is not the stock base or -fast
+# variant, i.e. a model prepared by its own toolchain. prepare.sh must never
+# re-download or re-quantize the stock base for one (a 19.5 GB fetch that would
+# never be served); it only keeps the stock DFlash2 drafter in sync.
+MODEL_CUSTOM=0
+if [ -n "${MODEL:-}" ] && [ -d "$MODEL" ] && [ "$MODEL" != "$BASE" ] && [ "$MODEL" != "$BASE-fast" ]; then
+  MODEL_CUSTOM=1
+fi
 # Two prepares racing one model dir can interleave a shard rewrite with an index
 # write and leave the dir inconsistent, and the entrypoint runs prepare before
 # every start, so a booting container races `compose run prepare`. The lock sits
@@ -24,10 +32,15 @@ exec 9>"$MODELS_ROOT/.prepare.lock"
 flock -w "${PREPARE_LOCK_WAIT:-600}" 9 || { echo "prepare: another preparation still holds $MODELS_ROOT/.prepare.lock after ${PREPARE_LOCK_WAIT:-600}s; refusing to run concurrently"; exit 1; }
 
 state() {  # prints the steps still to do
-python - "$BASE" <<'EOF'
+python - "$BASE" "${MODEL_CUSTOM:-0}" <<'EOF'
 import json, os, struct, sys
 d = sys.argv[1].rstrip("/") + "/"
 todo = []
+custom = (sys.argv[2] if len(sys.argv) > 2 else "0") == "1"
+if custom:  # a custom served model: only keep the stock DFlash2 drafter in sync
+    if os.environ.get("DFLASH2", "1") != "0" and not os.path.exists(os.path.dirname(d[:-1]) + "/Qwen3.8-27B-DFlash2-W4A16/model.safetensors"):
+        todo.append("dflash2")
+    print(" ".join(todo)); sys.exit()
 # tokenizer.json belongs in this list: without it transformers builds an empty
 # vocabulary rather than failing, and the dir stays servable-looking all the way to
 # "ReasoningConfig: failed to tokenize reasoning strings" at startup.
@@ -98,7 +111,12 @@ done
 # A template that does not match the known pattern warns and is left alone;
 # only an unreadable one fails prepare. HARDEN_TEMPLATES=0 skips the step.
 if [ "${HARDEN_TEMPLATES:-1}" != "0" ]; then
-  python prepare/harden_chat_template.py
+  # Only the stock dirs: an unguarded call rewrites every models/*/chat_template.jinja
+  # and would touch dirs prepare.sh does not own (a custom MODEL is left alone).
+  HDIRS=()
+  [ -d "$BASE" ] && HDIRS+=("$BASE")
+  [ -d "$BASE-fast" ] && HDIRS+=("$BASE-fast")
+  [ ${#HDIRS[@]} -gt 0 ] && python prepare/harden_chat_template.py "${HDIRS[@]}"
 fi
 # Gotcha 58: the shipped chat template accepts only xhigh/medium/low, so the
 # gpt-5 vocabulary clients speak (`minimal`, `high`, `max`) raises inside the
@@ -108,18 +126,20 @@ fi
 # template's own levels keep their behaviour and an omitted effort keeps the
 # template default (xhigh). Idempotent (marker in the rewritten block, with a
 # v1 -> v2 upgrade) and self-healing: a re-download that clobbers
-# chat_template.jinja is re-translated on the next prepare. Also covers the
-# model actually served (MODEL) when it was prepared outside this script.
+# chat_template.jinja is re-translated on the next prepare. A custom MODEL is
+# deliberately excluded: prepare.sh must never rewrite a dir it does not own.
 # A template whose effort block matches no known shape warns and is left alone;
 # TRANSLATE_EFFORT=0 skips the step.
 if [ "${TRANSLATE_EFFORT:-1}" != "0" ]; then
-  DIRS=("$BASE")
+  DIRS=()
+  [ -d "$BASE" ] && DIRS+=("$BASE")
   [ -d "$BASE-fast" ] && DIRS+=("$BASE-fast")
-  if [ -n "${MODEL:-}" ] && [ -d "$MODEL" ] && [ "$MODEL" != "$BASE" ] && [ "$MODEL" != "$BASE-fast" ]; then
-    DIRS+=("$MODEL")
-  fi
-  python prepare/translate_chat_template.py "${DIRS[@]}"
+  [ ${#DIRS[@]} -gt 0 ] && python prepare/translate_chat_template.py "${DIRS[@]}"
 fi
 LEFT=$(state | sed 's/\bdflash2\b//')
 [ -z "${LEFT// /}" ] || { echo "prepare: steps still missing after run: $LEFT"; exit 1; }
-echo "prepare: model ready at $BASE$([ "${FAST_VARIANT:-1}" != 0 ] && echo " (+ $BASE-fast)")"
+if [ "$MODEL_CUSTOM" = "1" ]; then
+  echo "prepare: custom model $MODEL left untouched; stock DFlash2 drafter in sync"
+else
+  echo "prepare: model ready at $BASE$([ "${FAST_VARIANT:-1}" != 0 ] && echo " (+ $BASE-fast)")"
+fi
