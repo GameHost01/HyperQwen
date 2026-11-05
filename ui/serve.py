@@ -1636,8 +1636,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             new_text = apply_env(text, targets)
             with open(ENV_PATH, "w", encoding="utf-8") as f:
                 f.write(new_text)
+            # Auto-apply reasoning effort to the chat template (vLLM 0.30.0
+            # lacks --chat-template-kwargs, so we rewrite the template directly)
+            template_note = ""
+            effort = targets.get("REASONING_EFFORT", "")
+            if effort in ("off", "low", "medium", "xhigh"):
+                script = os.path.join(REPO, "prepare", "apply_reasoning_effort.py")
+                if os.path.isfile(script):
+                    try:
+                        r = subprocess.run(
+                            [sys.executable, script, "--effort", effort],
+                            cwd=REPO, capture_output=True, text=True, timeout=30)
+                        if r.returncode == 0:
+                            template_note = " Chat template updated."
+                        else:
+                            template_note = f" (template warn: {r.stderr.strip()[:120]})"
+                    except Exception as e:
+                        template_note = f" (template error: {e})"
             self._json({"ok": True, "backup": bak,
-                        "note": "Saved. Restart the server to apply."})
+                        "note": "Saved. Restart the server to apply." + template_note})
         elif p == "/api/keygen":
             current = parse_env(read_env_text())
             key = secrets.token_hex(24)  # 48 hex chars, like `openssl rand -hex 24`

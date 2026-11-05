@@ -221,9 +221,9 @@ if [ "${REQ_METRICS:-0}" = 1 ]; then
   # is mean acceptance length, draft acceptance rate and the step histogram; REQ_METRICS_DETAILED=1
   # adds the ordered per-step accepted/proposed arrays, which upstream says is not free, so it is a
   # separate opt-in and off in every profile anyone benchmarks (#66, #75, gotcha 53).
-  SPEC_METRICS=summary; [ "${REQ_METRICS_DETAILED:-0}" = 1 ] && SPEC_METRICS=detailed
-  METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage
-                --per-request-spec-decode-metrics "$SPEC_METRICS")
+  # --per-request-spec-decode-metrics requires speculative decoding to be enabled (vLLM 0.30.0
+  # validates this); batch mode never enables spec decoding, so omit the flag.
+  METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage)
 fi
 
 # Vision. --language-model-only drops the vision tower cleanly -- no weights loaded,
