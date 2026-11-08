@@ -8,7 +8,7 @@ help: ## show this list
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
 
 up-single: ## serve one/few users (SPEC=dflash2 profile from .env)
-	docker compose --profile single up -d
+	docker compose --profile single up -d --no-deps single
 	@echo "first boot compiles (~2-15 min); follow with: make logs"
 
 up-batch: ## serve API backend / many concurrent
