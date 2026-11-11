@@ -14,48 +14,25 @@ audio request function skips SSE comments like the other two. Checked against a 
 that sends a keep-alive before three tokens: stock fails with the error above, patched returns the
 text. Upstream main has the same code.
 
---- exported from cpuchip/vllm 757723b (bench-sse-keepalive); regenerate with scripts/export-patch.sh, do not edit ---
+Kind: fix
+What: `vllm bench serve` no longer fails a request whose server sends an SSE keep-alive before the
+  first token: the request functions stripped each network chunk, which deleted the blank line
+  between SSE messages and glued the `: keep-alive` comment to every message after it. With the
+  launchers' `--sse-keep-alive-interval 30`, that failed every prompt whose prefill took over 30 s
+  (`run_benchmarks.sh --long` read zeros; #216 lost its 48k+ rows). The audio request function also
+  skips SSE comments now
+Upstream: none yet
+Cut-against: 0.33.0: #51172 passes chunks unstripped upstream; what is left is the audio function's skip of SSE
+  comments
+Retires-when: upstream skips SSE comments in async_request_openai_audio (#51172 carries the rest)
+
+--- exported from b7080c4a1b (bench-sse-keepalive); regenerate with scripts/export-patch.sh, do not edit ---
 
 diff --git a/benchmarks/lib/endpoint_request_func.py b/benchmarks/lib/endpoint_request_func.py
-index 54c6ce6..a12cbf6 100644
+index 442b8fa53a..bfdaced5d3 100644
 --- a/benchmarks/lib/endpoint_request_func.py
 +++ b/benchmarks/lib/endpoint_request_func.py
-@@ -207,8 +207,9 @@
-                 handler = StreamedResponseHandler()
- 
-                 async for chunk_bytes in response.content.iter_any():
--                    chunk_bytes = chunk_bytes.strip()
--                    if not chunk_bytes:
-+                    # port(bench-sse-keepalive): the SSE separators are data; stripping a chunk
-+                    # glues a keep-alive comment to every message after it (see the patch header).
-+                    if not chunk_bytes.strip():
-                         continue
- 
-                     messages = handler.add_chunk(chunk_bytes)
-@@ -384,8 +385,9 @@
-                 first_chunk_received = False
-                 handler = StreamedResponseHandler()
-                 async for chunk_bytes in response.content.iter_any():
--                    chunk_bytes = chunk_bytes.strip()
--                    if not chunk_bytes:
-+                    # port(bench-sse-keepalive): the SSE separators are data; stripping a chunk
-+                    # glues a keep-alive comment to every message after it (see the patch header).
-+                    if not chunk_bytes.strip():
-                         continue
- 
-                     message_strings = handler.add_chunk(chunk_bytes)
-@@ -513,14 +515,19 @@
-                     handler = StreamedResponseHandler()
- 
-                     async for chunk_bytes in response.content.iter_any():
--                        chunk_bytes = chunk_bytes.strip()
--                        if not chunk_bytes:
-+                        # port(bench-sse-keepalive): the SSE separators are data; stripping a chunk
-+                        # glues a keep-alive comment to every message after it (see the patch header).
-+                        if not chunk_bytes.strip():
-                             continue
- 
-                         messages = handler.add_chunk(chunk_bytes)
+@@ -759,6 +759,10 @@
                          for message in messages:
                              if type(message) is bytes:
                                  message = message.decode("utf-8")

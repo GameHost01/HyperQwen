@@ -2,13 +2,17 @@
 #
 #   docker compose --profile single up -d     # low latency: MTP speculative decoding
 #   docker compose --profile batch  up -d     # throughput
+#   docker compose --profile turing up -d     # RTX 20-series (set GPU_COUNT=2 in .env; docs/turing.md)
 #   docker compose run --rm prepare           # just download + requantize the model
 #   docker compose run --rm single verify     # verify.sh inside the container
 #
 # Knobs go in a .env file next to this file (never committed): VLLM_API_KEY=...,
 # and any of the start-script variables (CTX, KV, MAX_LEN, MAX_SEQS, GPU_UTIL, VISION,
-# SPEC_ATTN, DRAFT_TOKENS, EXTRA_ARGS, ...) — .env is passed straight into the
-# container. Fastest single-user decode, if the card is yours alone (README,
+# SPEC_ATTN, DRAFT_TOKENS, FA2_FP8KV, EXTRA_ARGS, ...) — .env is passed straight into the
+# container (on a compute capability 8.6 GPU SPEC=mtp CTX=long and SPEC=dflash2 CTX=long default to PTH_FA=1,
+# the pth-flash-attn kernel in the image; PTH_FA=0 opts out, and FA2_FP8KV defaults to 1 on SPEC=dflash2 CTX=long
+# there when PTH_FA does not apply, with the fa2/ plugin in the image; FA2_FP8KV=0 restores int8 + Triton).
+# Fastest single-user decode, if the card is yours alone (README,
 # "If you are the only user"; the drafter it needs is already downloaded by
 # prepare):
 #
@@ -79,7 +83,7 @@ x-qwen: &qwen
 x-serve: &serve
   <<: *qwen
   ports:
-    - "${PORT:-18020}:${PORT:-18020}"
+    - "${BIND:-127.0.0.1}:${PORT:-18020}:${PORT:-18020}"
   depends_on:
     prepare:
       condition: service_completed_successfully
@@ -116,6 +120,14 @@ services:
     profiles: [batch]
     command: batch
 
+  # RTX 20-series (Turing, sm75), e.g. 2x RTX 2080 Ti 22 GB: fp16 W4A16 + DFlash2, FlashInfer
+  # full graphs, TP picked from the visible cards. Put GPU_COUNT=2 in .env (the default hands
+  # the container one card). Runs start-turing.sh; see docs/turing.md and docs/docker.md.
+  turing:
+    <<: *serve
+    profiles: [turing]
+    command: turing
+
   # Second standalone engine on its own card (TP=1, same launcher, own
   # port). Inert unless --profile solo; needs GPU_COUNT=all in .env so the
   # reservation exposes the extra card. See the header for the layout.
@@ -133,7 +145,7 @@ services:
       CUDA_VISIBLE_DEVICES: "2"  # explicit value wins over .env's 0,1
       EXTRA_ARGS: ""             # one card: .env's --tensor-parallel-size must not apply
     ports:
-      - "${SOLO_PORT:-18021}:${SOLO_PORT:-18021}"
+      - "${BIND:-127.0.0.1}:${SOLO_PORT:-18021}:${SOLO_PORT:-18021}"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:${SOLO_PORT:-18021}/health"]
       interval: 30s

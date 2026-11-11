@@ -164,8 +164,8 @@ Community-built; not benchmarked on the reference box, and no decode rate was
 reported. The base model declares its own license on the Hub (`other`); read
 it before redistributing.
 
-**Any other export**, including single-shard and asymmetric-AWQ ones the base
-model's three `quant_*.py` scripts cannot open, goes through the streaming
+**Any other export**, including single-shard ones too big for the base model's
+three `quant_*.py` scripts to read into RAM, goes through the streaming
 requant (contributed in
 [#37](https://github.com/syv-ai/HyperQwen/pull/37)). The worked
 example is
@@ -184,13 +184,13 @@ MODEL=$PWD/models/Qwen3.8-27B-Uncensored-W4A16 SPEC=mtp CTX=long PREFIX_CACHE=1 
 ```
 
 It needs `prepare/quant_heads_stream.py` rather than the three `quant_*.py` steps
-the base model uses, for two reasons that are properties of the checkpoint and not
-of the model: it ships as **one 18.6 GB shard**, which the three scripts read into
-RAM whole before rewriting, and its body is **asymmetric AWQ**, which those scripts
-would copy onto the symmetric tensors they write — vLLM then looks for a
-`weight_zero_point` that was never written. The streaming script handles both and
-produces the same tensors otherwise; `bash verify.sh --no-server` with `MODEL=` set
-checks the result exactly as it checks the base model.
+the base model uses, because of a property of the checkpoint and not of the model:
+it ships as **one 18.6 GB shard**, which the three scripts read into RAM whole before
+rewriting. Its **asymmetric AWQ** body is not a reason: all four scripts declare the
+groups they add symmetric with no zero point
+([#212](https://github.com/syv-ai/HyperQwen/pull/212)). The streaming script produces
+the same tensors otherwise; `bash verify.sh --no-server` with `MODEL=` set checks the
+result exactly as it checks the base model.
 
 **`SPEC=dflash2` needs its pool resized for this checkpoint.** After requantization
 it is 15.68 GiB of weights against the fast variant's 14.71, and the DFlash2 branch
@@ -204,11 +204,12 @@ reserved 5.2 GiB memory for KV Cache as specified by kv_cache_memory_bytes confi
 torch.OutOfMemoryError: Tried to allocate 960.00 MiB ... 926.44 MiB is free
 ```
 
-Hand that gigabyte back and it comes up. `CTX=long` (int8 KV) is the one to spend it
+Hand that gigabyte back and it comes up. `CTX=long` with int8 KV (`FA2_FP8KV=0`; the default on an 8.6 GPU is now the pth-flash-attn kernel on the same cache, or fp8 on the fa2/ plugin, neither of which
+this run measured) is the one to spend it
 on, because it buys roughly twice the context per byte of pool that `CTX=fast` does:
 
 ```bash
-MODEL=$PWD/models/Qwen3.8-27B-Uncensored-W4A16 SPEC=dflash2 CTX=long PREFIX_CACHE=1 \
+MODEL=$PWD/models/Qwen3.8-27B-Uncensored-W4A16 SPEC=dflash2 CTX=long FA2_FP8KV=0 PREFIX_CACHE=1 \
   KV_MEM=4456028569 DFLASH_MAX_LEN=98304 bash single-user/start_qwen.sh
 ```
 

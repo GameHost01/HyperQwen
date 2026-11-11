@@ -92,13 +92,20 @@ VERIFICATION
 
 ---
 
---- exported from cpuchip/vllm a332a16a2 (spec-decode-scratch-token-units); regenerate with scripts/export-patch.sh, do not edit ---
+Kind: own
+What: mq3d scratch sized in tokens, not sequences (fork #46, #57)
+Upstream: none
+Cut-against: 0.33.0: #56148 gave upstream its own multi-query 3D path (q <= 8, not INT4) over the same scratch;
+  within-budget's plan covers both readers
+Retires-when: rides with mq3d
+
+--- exported from 95d2242620 (spec-decode-scratch-token-units); regenerate with scripts/export-patch.sh, do not edit ---
 
 diff --git a/v1/attention/backends/triton_attn.py b/v1/attention/backends/triton_attn.py
-index 98356fd7d..2d7b1297c 100644
+index 86aa8c12ef..4722fa2057 100644
 --- a/v1/attention/backends/triton_attn.py
 +++ b/v1/attention/backends/triton_attn.py
-@@ -57,6 +57,10 @@
+@@ -62,6 +62,10 @@
  # constants
  MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
  NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
@@ -109,7 +116,7 @@ index 98356fd7d..2d7b1297c 100644
  
  
  @dataclass
-@@ -77,7 +81,9 @@
+@@ -82,7 +86,9 @@
      block_table: torch.Tensor
      slot_mapping: torch.Tensor
  
@@ -120,10 +127,35 @@ index 98356fd7d..2d7b1297c 100644
      num_par_softmax_segments: int
      softmax_segm_output: torch.Tensor
      softmax_segm_max: torch.Tensor
-@@ -158,9 +164,53 @@
- 
-         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+@@ -166,9 +172,14 @@
+                 NUM_PAR_SOFTMAX_SEGMENTS * self.num_heads_kv
+             )
          headdim_padded = next_power_of_2(self.headdim)
++        # (syv) Two readers share this scratch, both indexed by query token. Upstream's
++        # multi-query 3D path (#56148) needs max_num_seqs_3d * max_query_len_3d rows
++        # (query length capped at MAX_3D_QUERY_LEN, INT4 excluded) and falls back to 2D
++        # when the scratch is shorter. The int4 multi-query 3D path of ours needs
++        # scratch_token_capacity_3d (below); the allocation covers the larger of the two.
+         max_query_len_3d = 1
+         speculative_config = vllm_config.speculative_config
+-        # The INT4 launcher runs multi-query batches in 2D only.
++        # Upstream's INT4 launcher runs multi-query batches in 2D only; ours is sized below.
+         if (
+             speculative_config is not None
+             and kv_cache_spec.kv_quant_mode != KVQuantMode.INT4_PER_TOKEN_HEAD
+@@ -178,24 +189,71 @@
+                 2 if speculative_config.parallel_drafting else 1
+             )
+             max_query_len_3d = min(query_len, MAX_3D_QUERY_LEN)
+-        # Scratch is indexed by query token, including verification tokens.
+         max_num_seqs_3d = min(
+             self.seq_threshold_3D, vllm_config.scheduler_config.max_num_seqs
+         )
+-        max_num_tokens_3d = max_num_seqs_3d * max_query_len_3d
+         if self.max_seqs_64_segments > 0:
+             self.num_par_softmax_segments = 64
+-            # build() reuses this scratch at 16 segments with proportionally more rows.
+-            max_num_tokens_3d = max(
 +
 +        # ---- UNIT SPLIT ------------------------------------------------------------
 +        # These three quantities were one variable, in three different units. The
@@ -147,12 +179,29 @@ index 98356fd7d..2d7b1297c 100644
 +        # capacity that can hold every policy-eligible batch.
 +        self.max_query_len_3d = MAX_QUERY_LEN_3D
 +        _sched = self.vllm_config.scheduler_config
-+        self.scratch_token_capacity_3d = min(
-+            _sched.max_num_batched_tokens,
-+            min(_sched.max_num_seqs, self.seq_threshold_3D) * self.max_query_len_3d,
++        self.scratch_token_capacity_3d = max(
++            min(
++                _sched.max_num_batched_tokens,
++                min(_sched.max_num_seqs, self.seq_threshold_3D) * self.max_query_len_3d,
++            ),
++            max_num_seqs_3d * max_query_len_3d,
 +        )
 +
 +        _rows = self.scratch_token_capacity_3d
++        _segment_ratio = self.num_par_softmax_segments // NUM_PAR_SOFTMAX_SEGMENTS
++        if _segment_ratio > 1:
++            # (syv) upstream's SM120 sizing (#58482) in token units: rows at 64 segments,
++            # which build() reuses at 16 segments with _segment_ratio times the rows, so
++            # that layout must still hold the whole token capacity.
++            _rows = max(
++                min(self.max_seqs_64_segments, _rows),
+                 min(self.max_seqs_64_segments, max_num_seqs_3d) * max_query_len_3d,
+-                cdiv(
+-                    max_num_tokens_3d,
+-                    self.num_par_softmax_segments // NUM_PAR_SOFTMAX_SEGMENTS,
+-                ),
++                cdiv(_rows, _segment_ratio),
+             )
 +        _row_bytes = 4 * (
 +            self.num_heads_q * self.num_par_softmax_segments * headdim_padded
 +            + 2 * self.num_heads_q * self.num_par_softmax_segments
@@ -163,29 +212,29 @@ index 98356fd7d..2d7b1297c 100644
 +            "int4 3D scratch: capacity=%d query tokens (min of max_num_batched_tokens=%d, "
 +            "min(max_num_seqs=%d, seq_threshold_3D=%d) * max_query_len_3d=%d); "
 +            "%d B/row, %.2f MiB for this instance",
-+            _rows, _sched.max_num_batched_tokens, _sched.max_num_seqs,
++            self.scratch_token_capacity_3d, _sched.max_num_batched_tokens, _sched.max_num_seqs,
 +            self.seq_threshold_3D, self.max_query_len_3d,
 +            _row_bytes, _row_bytes * _rows / 2**20,
 +        )
 +
          self.softmax_segm_output = torch.empty(
              (
--                self.seq_threshold_3D,
+-                max_num_tokens_3d,
 +                _rows,
                  self.num_heads_q,
                  self.num_par_softmax_segments,
                  headdim_padded,
-@@ -169,15 +219,24 @@
+@@ -204,15 +262,28 @@
              device=device,
          )
          self.softmax_segm_max = torch.empty(
--            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+-            (max_num_tokens_3d, self.num_heads_q, self.num_par_softmax_segments),
 +            (_rows, self.num_heads_q, self.num_par_softmax_segments),
              dtype=torch.float32,
              device=device,
          )
          self.softmax_segm_expsum = torch.empty(
--            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+-            (max_num_tokens_3d, self.num_heads_q, self.num_par_softmax_segments),
 +            (_rows, self.num_heads_q, self.num_par_softmax_segments),
              dtype=torch.float32,
              device=device,
@@ -197,21 +246,25 @@ index 98356fd7d..2d7b1297c 100644
 +            self.softmax_segm_output.shape[0]
 +            == self.softmax_segm_max.shape[0]
 +            == self.softmax_segm_expsum.shape[0]
-+            == self.scratch_token_capacity_3d
++        ) and (
++            self.softmax_segm_max.shape[0] == self.scratch_token_capacity_3d
++            if _segment_ratio == 1
++            else self.softmax_segm_max.shape[0] * _segment_ratio
++            >= self.scratch_token_capacity_3d
 +        ), "int4 3D scratch buffers disagree with the declared token capacity"
          self.rswa_window = model_config.rswa_window
-         self.persistent_rswa_prefix_lens: torch.Tensor | None = None
-         if self.rswa_window is not None:
-@@ -246,6 +305,8 @@
-             suffix_kv_lens=suffix_kv_lens,
-             prefix_scheduler_metadata=prefix_scheduler_metadata,
+         # R-SWA restages prefix lengths in build(), which the no-op
+         # update_draft_decode_metadata() does not refresh.
+@@ -261,6 +332,8 @@
+             slot_mapping=slot_mapping,
+             causal=common_attn_metadata.causal,
              seq_threshold_3D=self.seq_threshold_3D,
 +            max_query_len_3d=self.max_query_len_3d,
 +            scratch_token_capacity_3d=self.scratch_token_capacity_3d,
              num_par_softmax_segments=self.num_par_softmax_segments,
              softmax_segm_output=self.softmax_segm_output,
              softmax_segm_max=self.softmax_segm_max,
-@@ -651,6 +712,8 @@
+@@ -692,6 +765,8 @@
          block_table = attn_metadata.block_table
  
          seq_threshold_3D = attn_metadata.seq_threshold_3D
@@ -220,7 +273,7 @@ index 98356fd7d..2d7b1297c 100644
          num_par_softmax_segments = attn_metadata.num_par_softmax_segments
          softmax_segm_output = attn_metadata.softmax_segm_output
          softmax_segm_max = attn_metadata.softmax_segm_max
-@@ -716,6 +779,8 @@
+@@ -757,6 +832,8 @@
              k_descale=k_descale,
              v_descale=v_descale,
              seq_threshold_3D=seq_threshold_3D,
@@ -230,7 +283,7 @@ index 98356fd7d..2d7b1297c 100644
              softmax_segm_output=softmax_segm_output,
              softmax_segm_max=softmax_segm_max,
 diff --git a/v1/attention/ops/int4_per_token_head.py b/v1/attention/ops/int4_per_token_head.py
-index 58b73d569..ece955e6e 100644
+index a9231396be..626bc9d6c0 100644
 --- a/v1/attention/ops/int4_per_token_head.py
 +++ b/v1/attention/ops/int4_per_token_head.py
 @@ -12,7 +12,30 @@
@@ -264,7 +317,7 @@ index 58b73d569..ece955e6e 100644
  from typing import Any
  
  import torch
-@@ -694,6 +717,8 @@
+@@ -695,6 +718,8 @@
      k_scale_cache,
      v_scale_cache,
      seq_threshold_3D,
@@ -273,7 +326,7 @@ index 58b73d569..ece955e6e 100644
      num_par_softmax_segments,
      softmax_segm_output,
      softmax_segm_max,
-@@ -752,10 +777,33 @@
+@@ -753,10 +778,33 @@
      # buffers directly. Opt-in via VLLM_INT4_MQ_3D=1 (promotion gates open).
      _mq = max_seqlen_q > 1
      _mq_3d_enabled = envs.VLLM_INT4_MQ_3D
@@ -308,7 +361,7 @@ index 58b73d569..ece955e6e 100644
          and q.shape[0] <= softmax_segm_output.shape[0]
          and q.shape[0] <= softmax_segm_max.shape[0]
          and q.shape[0] <= softmax_segm_expsum.shape[0]
-@@ -763,21 +811,73 @@
+@@ -764,21 +812,73 @@
      use_3d = not (
          seq_threshold_3D is None
          or num_par_softmax_segments is None
@@ -387,7 +440,7 @@ index 58b73d569..ece955e6e 100644
      # 3D never reads ``output_ptr`` and 2D never reads the segm tensors,
      # but Triton needs a non-null pointer everywhere; reuse ``out`` as
      # the placeholder for the unused side.
-@@ -938,6 +1038,8 @@
+@@ -939,6 +1039,8 @@
      k_scale_cache: torch.Tensor,
      v_scale_cache: torch.Tensor,
      seq_threshold_3D: int | None = None,
@@ -396,7 +449,7 @@ index 58b73d569..ece955e6e 100644
      num_par_softmax_segments: int | None = None,
      softmax_segm_output: torch.Tensor | None = None,
      softmax_segm_max: torch.Tensor | None = None,
-@@ -977,6 +1079,8 @@
+@@ -979,6 +1081,8 @@
          k_scale_cache=k_scale_cache,
          v_scale_cache=v_scale_cache,
          seq_threshold_3D=seq_threshold_3D,
@@ -406,10 +459,10 @@ index 58b73d569..ece955e6e 100644
          softmax_segm_output=softmax_segm_output,
          softmax_segm_max=softmax_segm_max,
 diff --git a/v1/attention/ops/triton_unified_attention.py b/v1/attention/ops/triton_unified_attention.py
-index 5522bc0b4..2b92ad2ef 100644
+index c8b6d680c8..a081f87cc1 100644
 --- a/v1/attention/ops/triton_unified_attention.py
 +++ b/v1/attention/ops/triton_unified_attention.py
-@@ -843,6 +843,8 @@
+@@ -864,6 +864,8 @@
      k_descale,
      v_descale,
      seq_threshold_3D=None,
@@ -418,7 +471,7 @@ index 5522bc0b4..2b92ad2ef 100644
      num_par_softmax_segments=None,
      softmax_segm_output=None,
      softmax_segm_max=None,
-@@ -910,6 +912,8 @@
+@@ -931,6 +933,8 @@
              k_scale_cache=k_scale_cache,
              v_scale_cache=v_scale_cache,
              seq_threshold_3D=seq_threshold_3D,

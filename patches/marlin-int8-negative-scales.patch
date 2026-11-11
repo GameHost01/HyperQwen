@@ -14,13 +14,19 @@ Apply from the installed vllm package directory:
 
 Validated against vLLM 0.28.0.
 
---- exported from cpuchip/vllm 3a9508d10 (marlin-int8-negative-scales); regenerate with scripts/export-patch.sh, do not edit ---
+Kind: fix
+What: Marlin W4A8 reads group scales as unsigned; AutoRound exports negative ones
+Upstream: none yet
+Cut-against: 0.33.0
+Retires-when: upstream PR
+
+--- exported from 7b5072b731 (marlin-int8-negative-scales); regenerate with scripts/export-patch.sh, do not edit ---
 
 diff --git a/model_executor/kernels/linear/mixed_precision/marlin.py b/model_executor/kernels/linear/mixed_precision/marlin.py
-index 387c33c11..bae372347 100644
+index 60687fc860..13591a141b 100644
 --- a/model_executor/kernels/linear/mixed_precision/marlin.py
 +++ b/model_executor/kernels/linear/mixed_precision/marlin.py
-@@ -82,6 +82,37 @@
+@@ -81,6 +81,37 @@
                  "W8A8 is not supported by marlin kernel."
              )
  

@@ -2,6 +2,7 @@ __pycache__/
 api_key.txt
 bench/quality-data/
 bench/results/
+bench/results-prefill-ab/
 models/
 profiles/
 qwen.log
@@ -18,4 +19,10 @@ bench/results/
 ui/.bootcal.json
 /.goose-notes
 /.agent-notes
+# fa2/build.py run in place, instead of through fa2/install.sh
+fa2/build-*/
+fa2/third_party/
+fa2/python/**/*.so
 
+# Turing launcher server logs
+/logs/

@@ -9,6 +9,15 @@
 # Needs patches/int4-kv-per-token-head.patch (applied by setup like the
 # rest of patches/). Profile contributed in PR #42 (@lachhabw).
 set -e
+# KV_OFFLOAD_GB=N has to become --kv-offloading-size before the allocator default below reads EXTRA_ARGS.
+# shellcheck disable=SC1091
+source "$(dirname "$(cd "$(dirname "$0")" && pwd)")/launcher_common.sh" \
+  || { echo "[alternative] cannot source launcher_common.sh - refusing to boot" >&2; exit 1; }
+qwen_normalize_extra_args
+qwen_check_bool_knobs
+qwen_fa2_fp8kv_single_only alternative.sh
+qwen_kv_offload_args
+qwen_prefix_cache
 
 if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
   ALLOC_DEFAULT=expandable_segments:False
@@ -38,7 +47,11 @@ REPO="$ALT_REPO"   # resolve_vllm_key reads $REPO/api_key.txt; unset, the file f
 # shellcheck disable=SC1091
 source "$ALT_REPO/resolve_api_key.sh" \
   || { echo "[alternative] cannot source resolve_api_key.sh - refusing to boot with an unknown key" >&2; exit 1; }
+# shellcheck disable=SC1091
+source "$ALT_REPO/launcher_common.sh" \
+  || { echo "[alternative] cannot source launcher_common.sh - refusing to boot" >&2; exit 1; }
 resolve_vllm_key
+resolve_bind_host
 export VLLM_DFLASH2_LOOKUP=${LOOKUP:-1}
 # The multi-query 3D verify for the int4 cache (patches/spec-decode-int4-kv-mq3d.patch) was opt-in and nothing
 # set it, so this profile ran the stock 2D verify: on a 4090 at 120k, DFlash2 k=7, fresh prefill, decode 43.9 / 26.5 /
@@ -52,8 +65,7 @@ export VLLM_INT4_MQ_3D=${INT4_MQ_3D:-1}
 # so it stays opt-in here too. INT8_LAYERS narrows it the same way.
 INT8_ACT=${INT8_ACT-}
 INT8_LAYERS=${INT8_LAYERS-mlp|linear_attn|self_attn}
-[ -n "$INT8_ACT" ] && export VLLM_MARLIN_INPUT_DTYPE=$INT8_ACT
-[ -n "$INT8_ACT" ] && [ -n "$INT8_LAYERS" ] && export VLLM_MARLIN_INT8_INCLUDE_RE=$INT8_LAYERS
+qwen_int8_exports "$INT8_ACT" "$INT8_LAYERS"
 
 # Ghost regions from a previous OOM-killed server hold host RAM hostage
 # (gotcha: 70 restarts of accumulation); same cleanup as start_qwen.sh.
@@ -63,6 +75,7 @@ if [ "${VLLM_OFFLOAD_KEEP_SHM:-0}" != 1 ]; then
     grep -lqs "$f" /proc/[0-9]*/maps 2>/dev/null || { echo "[alternative] removing stale offload region $f"; rm -f "$f"; }
   done
 fi
+qwen_kv_offload_shm_check
 
 MODEL=${MODEL:-models/Qwen3.8-27B-W4A16-AutoRound}
 DRAFT=${DRAFT:-models/Qwen3.8-27B-DFlash2-W4A16}
@@ -79,8 +92,15 @@ case "$SPEC" in
   *) echo "SPEC=$SPEC is not a mode here: dflash2 (default) or off." >&2; exit 1 ;;
 esac
 PORT=${PORT:-18020}
-GPU_UTIL=${GPU_UTIL:-0.95}   # 0.93 on WSL2 or with a desktop compositor on the card
-MAX_LEN=${MAX_LEN:-256000}   # 256000 needs the full 0.95; drop MAX_LEN before GPU_UTIL
+# Under WSL2 vLLM sees less than the nominal 24 GiB (22.75 GiB free on a 3090, #401), so 0.95 asks for more
+# than exists and the profile fails to start; 0.93 boots and holds the 256k window (446,128-token pool).
+# An explicit GPU_UTIL always wins; with a desktop compositor on the card, lower it yourself.
+if [ -z "${GPU_UTIL:-}" ] && { grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; }; then
+  GPU_UTIL=0.93
+  echo "WSL detected: GPU_UTIL=0.93 (0.95 exceeds the free memory WSL2 reports; set GPU_UTIL to override)"
+fi
+GPU_UTIL=${GPU_UTIL:-0.95}
+MAX_LEN=${MAX_LEN:-256000}   # 256000 needs the full 0.95 on native Linux; drop MAX_LEN before GPU_UTIL
 ATTN_ARGS="--attention-backend TRITON_ATTN --kv-cache-dtype int4_per_token_head"
 VISION=${VISION:-0}
 ENABLE_THINKING=${ENABLE_THINKING:-false}
@@ -90,20 +110,16 @@ MAX_SEQS=${MAX_SEQS:-1}
 CG=$(( MAX_SEQS * (DRAFT_TOKENS + 1) > 64 ? 64 : MAX_SEQS * (DRAFT_TOKENS + 1) ))
 # DFLASH_TOKENS>7 needs the synchronous scheduler, same as start_qwen.sh.
 if [ "$DRAFT_TOKENS" -gt 7 ]; then ASYNC_SCHED=${ASYNC_SCHED:-0}; else ASYNC_SCHED=${ASYNC_SCHED:-1}; fi
-PREFIX_CACHE=${PREFIX_CACHE:-1}
 
-VISION_ARGS="--language-model-only"
-[ "$VISION" = 1 ] && VISION_ARGS='--mm-processor-kwargs {"size":{"shortest_edge":65536,"longest_edge":2097152}}'
+qwen_vision_args
 
-PREFIX_ARGS=""
-[ "$PREFIX_CACHE" = 1 ] && PREFIX_ARGS="--enable-prefix-caching --mamba-cache-mode align"
 # With the drafter on, pass the retention interval explicitly: 0.30's unset default is 0 (the replay
 # boundaries only), where 0.29 resolved it to dense (vllm #55760); start_qwen.sh has the measurement.
 # The default here depends on a KV tier (the connector check above): without one it is 0, because at dense two
 # ~60K conversations on this int4 pool evicted each other completely (0 / 0 cached where 0 held 93.5% for both);
 # with one it is None (dense), which the tier serves from (gotcha 60). PREFIX_RETENTION sets it (0 = boundaries
 # only, empty = dense); the flag in EXTRA_ARGS wins.
-if [ "$PREFIX_CACHE" = 1 ] && [ "$SPEC" = dflash2 ]; then
+if [ "$PREFIX_CACHE_ON" = 1 ] && [ "$SPEC" = dflash2 ]; then
   case " ${EXTRA_ARGS:-} " in
     *"--prefix-cache-retention-interval"*) ;;
     *)
@@ -112,7 +128,7 @@ if [ "$PREFIX_CACHE" = 1 ] && [ "$SPEC" = dflash2 ]; then
         *) R_DEFAULT=0 ;;
       esac
       if [ "${PREFIX_RETENTION+set}" = set ]; then R=${PREFIX_RETENTION:-None}; else R=$R_DEFAULT; fi
-      PREFIX_ARGS="$PREFIX_ARGS --prefix-cache-retention-interval $R" ;;
+      EXTRA_ARGS="--prefix-cache-retention-interval $R ${EXTRA_ARGS:-}" ;;
   esac
 fi
 
@@ -125,26 +141,16 @@ ASYNC_ARGS=(--no-async-scheduling)
 # Not with --disable-log-stats (the timing fields need the engine-stats path).
 # Array, not $( [ ] && echo ): the command substitution exits 1 when the test
 # is false, which under `set -e` killed this script silently (#59).
-METRICS_ARGS=()
-if [ "${REQ_METRICS:-0}" = 1 ]; then
-  # vLLM 0.29.0: per-request speculative-decoding acceptance metrics ride in the response under
-  # metrics.speculative_decoding (n == 1 only; the field is experimental, shape as of v0.29.0). summary
-  # is mean acceptance length, draft acceptance rate and the step histogram; REQ_METRICS_DETAILED=1
-  # adds the ordered per-step accepted/proposed arrays, which upstream says is not free, so it is a
-  # separate opt-in and off in every profile anyone benchmarks (#66, #75, gotcha 53).
-  SPEC_METRICS=summary; [ "${REQ_METRICS_DETAILED:-0}" = 1 ] && SPEC_METRICS=detailed
-  METRICS_ARGS=(--enable-per-request-metrics --enable-force-include-usage
-                --per-request-spec-decode-metrics "$SPEC_METRICS")
-fi
+qwen_request_metrics_args "$SPEC"
 
-exec vllm serve "$MODEL" \
+qwen_exec vllm serve "$MODEL" \
   --served-model-name qwen3.8-27b \
-  --host 0.0.0.0 --port $PORT \
+  --host $BIND_HOST --port $PORT \
   --gpu-memory-utilization $GPU_UTIL \
   --max-model-len $MAX_LEN \
   --max-num-seqs $MAX_SEQS \
   --api-server-count 1 \
-  ${VISION_ARGS} \
+  "${VISION_ARGS[@]}" \
   ${ATTN_ARGS} \
   --mamba-ssm-cache-dtype float16 \
   "${ASYNC_ARGS[@]}" \
@@ -155,6 +161,6 @@ exec vllm serve "$MODEL" \
   --enable-prompt-tokens-details \
   "${METRICS_ARGS[@]}" \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --tool-strict-level "${TOOL_STRICT:-parameter}" \
   --default-chat-template-kwargs "{\"enable_thinking\": $ENABLE_THINKING}" \
-  ${PREFIX_ARGS} \
   ${EXTRA_ARGS}

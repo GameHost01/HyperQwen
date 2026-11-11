@@ -19,10 +19,17 @@ model's default sampling (temperature 1.0, top-p 0.95, top-k 20):
 Apply from the repo root:
   patch -p1 -d venv/lib/python3.12/site-packages/vllm < patches/sampler-small-topk-fast-softmax.patch
 
---- exported from cpuchip/vllm 9b58aeee3 (sampler-small-topk-fast-softmax); regenerate with scripts/export-patch.sh, do not edit ---
+Kind: feature
+What: sort-free top-k/top-p for small k, multi-block row softmax
+Upstream: none
+Cut-against: 0.33.0: #61996 added has_topp_only_rows (kept 4th, k_max after); #53987 (FLy) moved the rejection
+  sampler's softmax up, softmax_fp32 sits there
+Retires-when: upstreamed or superseded
+
+--- exported from 4d9486d4db (sampler-small-topk-fast-softmax); regenerate with scripts/export-patch.sh, do not edit ---
 
 diff --git a/v1/sample/metadata.py b/v1/sample/metadata.py
-index fa4ceac8e..1560b83f9 100644
+index fa4ceac8e7..1560b83f9c 100644
 --- a/v1/sample/metadata.py
 +++ b/v1/sample/metadata.py
 @@ -53,3 +53,6 @@
@@ -34,7 +41,7 @@ index fa4ceac8e..1560b83f9 100644
 +    top_k_max: int | None = None
 diff --git a/v1/sample/ops/row_softmax.py b/v1/sample/ops/row_softmax.py
 new file mode 100644
-index 000000000..f8272f480
+index 0000000000..f8272f4809
 --- /dev/null
 +++ b/v1/sample/ops/row_softmax.py
 @@ -0,0 +1,74 @@
@@ -113,10 +120,10 @@ index 000000000..f8272f480
 +        return row_softmax_fp32(x)
 +    return x.softmax(dim=-1, dtype=torch.float32)
 diff --git a/v1/sample/ops/topk_topp_sampler.py b/v1/sample/ops/topk_topp_sampler.py
-index aeb82dec4..bbb1c03cd 100644
+index 14ee9b7064..d73823421e 100644
 --- a/v1/sample/ops/topk_topp_sampler.py
 +++ b/v1/sample/ops/topk_topp_sampler.py
-@@ -147,25 +147,38 @@
+@@ -289,24 +289,37 @@
          # Every accelerator backend can fall back to native sampling at runtime.
          register_top_k_top_p_warmups()
  
@@ -138,8 +145,7 @@ index aeb82dec4..bbb1c03cd 100644
          p: torch.Tensor | None,
 +        k_max: int | None = None,
      ) -> tuple[torch.Tensor, torch.Tensor | None]:
-         """
-         PyTorch-native implementation of top-k and top-p sampling.
+         """PyTorch-native implementation of top-k and top-p sampling.
  
          The logits tensor may be updated in-place.
          """
@@ -157,8 +163,8 @@ index aeb82dec4..bbb1c03cd 100644
          return (
              random_sample(probs, generators, self.use_fp64_gumbel),
              logits_to_return,
-@@ -365,12 +378,55 @@
-     return probs.div(q).argmax(dim=-1).view(-1)
+@@ -498,11 +511,44 @@
+         return xpu_sample(logits, k, p, self.logprobs_mode)
  
  
 +SMALL_K_MAX = 64
@@ -194,12 +200,15 @@ index aeb82dec4..bbb1c03cd 100644
 +
 +
  def apply_top_k_top_p(
--    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
-+    logits: torch.Tensor,
-+    k: torch.Tensor | None,
-+    p: torch.Tensor | None,
+     logits: torch.Tensor,
+     k: torch.Tensor | None,
+     p: torch.Tensor | None,
+     has_topp_only_rows: bool = True,
 +    k_max: int | None = None,
  ) -> torch.Tensor:
+     """Apply top-k and/or top-p masking to logits.
+ 
+@@ -512,6 +558,14 @@
      if p is None and k is None:
          return logits
  
@@ -212,24 +221,25 @@ index aeb82dec4..bbb1c03cd 100644
 +        return apply_top_k_top_p_small_k(logits, k, p, k_max)
 +
      if HAS_TRITON:
-         return apply_top_k_top_p_triton(logits, k, p)
- 
+         return apply_top_k_top_p_triton(
+             logits, k, p, has_topp_only_rows=has_topp_only_rows
 diff --git a/v1/sample/rejection_sampler.py b/v1/sample/rejection_sampler.py
-index 85b623bd8..765243597 100644
+index ce7a1cd1dc..db272e4349 100644
 --- a/v1/sample/rejection_sampler.py
 +++ b/v1/sample/rejection_sampler.py
-@@ -481,7 +481,9 @@
-             return output_token_ids
+@@ -498,7 +498,10 @@
  
-     # Compute probability distribution from target logits.
--    target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
-+    from vllm.v1.sample.ops.row_softmax import softmax_fp32  # syv patch
+     target_probs: torch.Tensor | None = None
+     if fly_enabled or not sampling_metadata.all_greedy:
+-        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
++        # Compute probability distribution from target logits.
++        from vllm.v1.sample.ops.row_softmax import softmax_fp32  # syv patch
 +
-+    target_probs = softmax_fp32(target_logits)
-     assert target_probs.is_contiguous()
++        target_probs = softmax_fp32(target_logits)
+         assert target_probs.is_contiguous()
  
-     # Sample recovered tokens for each position.
-@@ -571,7 +573,7 @@
+     fly_entropy: torch.Tensor | None = None
+@@ -642,7 +645,7 @@
  
      # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
      # which is slow for large vocab sizes. This may cause performance issues.
@@ -239,10 +249,10 @@ index 85b623bd8..765243597 100644
  
  def expand_batch_to_tokens(
 diff --git a/v1/sample/sampler.py b/v1/sample/sampler.py
-index 3efaf33d9..2c7487edf 100644
+index a9cb2f1a23..558bb7ec50 100644
 --- a/v1/sample/sampler.py
 +++ b/v1/sample/sampler.py
-@@ -289,6 +289,7 @@
+@@ -352,6 +352,7 @@
              sampling_metadata.generators,
              sampling_metadata.top_k,
              sampling_metadata.top_p,
@@ -251,10 +261,10 @@ index 3efaf33d9..2c7487edf 100644
  
          if greedy_sampled is None:
 diff --git a/v1/spec_decode/llm_base_proposer.py b/v1/spec_decode/llm_base_proposer.py
-index 1bd1bdc45..044855c5b 100644
+index eb4db3c175..0f256be74a 100644
 --- a/v1/spec_decode/llm_base_proposer.py
 +++ b/v1/spec_decode/llm_base_proposer.py
-@@ -1845,6 +1845,11 @@
+@@ -1821,6 +1821,11 @@
  # Refer to https://github.com/vllm-project/vllm/pull/16899 for the details.
  # FIXME(woosuk): The logic here is duplicated with the main sampling code.
  # We should refactor this to reuse the same sampling implementation.
@@ -266,7 +276,7 @@ index 1bd1bdc45..044855c5b 100644
  def compute_probs_and_sample_next_token(
      logits: torch.Tensor,
      sampling_metadata: SamplingMetadata,
-@@ -1867,7 +1872,29 @@
+@@ -1843,7 +1848,29 @@
          is_greedy = temperature < _SAMPLING_EPS
          temperature = torch.where(is_greedy, 1.0, temperature)
      logits.div_(temperature.view(-1, 1))
@@ -298,10 +308,10 @@ index 1bd1bdc45..044855c5b 100644
      # NOTE(woosuk): Currently, we ignore most of the sampling parameters in
      # generating the draft tokens. We only use the temperature. While this
 diff --git a/v1/worker/gpu_input_batch.py b/v1/worker/gpu_input_batch.py
-index 01b6b5b0c..77ceec79a 100644
+index 73a8c0eb9a..9883cf170f 100644
 --- a/v1/worker/gpu_input_batch.py
 +++ b/v1/worker/gpu_input_batch.py
-@@ -942,6 +942,7 @@
+@@ -937,6 +937,7 @@
              all_random=self.all_random,
              top_p=None if self.no_top_p else self.top_p[:num_reqs],
              top_k=None if self.no_top_k else self.top_k[:num_reqs],

@@ -36,13 +36,19 @@ Retired on the 0.29 port: the VLLM_V2_CUDAGRAPH_MEM_MIB reserve hunk in v1/worke
 vLLM 0.29 profiles CUDA graph memory natively (cudagraph_utils.profile_cudagraph_memory, upstream #53306), so the
 reserve knob is a no-op there; only the kv_cache_utils hunks remain.
 
---- exported from cpuchip/vllm 1203697ad (hybrid-kv-groups-v2-cudagraph); regenerate with scripts/export-patch.sh, do not edit ---
+Kind: fix
+What: KV group sizing when the smallest bucket is the drafter's sliding-window layers
+Upstream: none yet
+Cut-against: 0.33.0: #61183 moved the planning code to v1/core/kv_cache_planning.py; hunks unchanged
+Retires-when: upstream PR
 
-diff --git a/v1/core/kv_cache_utils.py b/v1/core/kv_cache_utils.py
-index 28478b69f..4f720299b 100644
---- a/v1/core/kv_cache_utils.py
-+++ b/v1/core/kv_cache_utils.py
-@@ -1432,6 +1432,51 @@
+--- exported from 0cece81694 (hybrid-kv-groups-v2-cudagraph); regenerate with scripts/export-patch.sh, do not edit ---
+
+diff --git a/v1/core/kv_cache_planning.py b/v1/core/kv_cache_planning.py
+index ae15c0f4d2..0c1d9df03b 100644
+--- a/v1/core/kv_cache_planning.py
++++ b/v1/core/kv_cache_planning.py
+@@ -413,6 +413,51 @@
      return not kv_cache_spec
  
  
@@ -94,7 +100,7 @@ index 28478b69f..4f720299b 100644
  def _get_kv_cache_groups_uniform_page_size(
      kv_cache_spec: dict[str, KVCacheSpec],
  ) -> list[KVCacheGroupSpec]:
-@@ -1549,6 +1594,10 @@
+@@ -530,6 +575,10 @@
          # layers while accommodating speculative decoding drafters that add
          # extra layers to one attention type.
          group_size = max_num_layers
