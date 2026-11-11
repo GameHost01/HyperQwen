@@ -40,7 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /
 # xgrammar from mlc-ai/xgrammar#989 plus the Qwen template-newline fix, over the release vLLM pins: a maxLength on a
 # tool's string parameter otherwise drops decode to ~7 tok/s under TOOL_STRICT=parameter (xgrammar/README.md).
 COPY xgrammar/ xgrammar/
-RUN bash xgrammar/install.sh
+RUN CXXFLAGS="-Wno-odr -Wno-error=odr" bash xgrammar/install.sh
 
 # The LSA plugin (lsa/, optional: LSA=1, SPEC=mtp CTX=long): Python and Triton, nothing compiles. The
 # distilled map it reads goes in the models volume, fetched by docker/prepare.sh when LSA=1.
